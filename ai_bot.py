@@ -23,6 +23,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 color_init(autoreset=True)
 load_dotenv()
 
+
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # ───────────────────────── CONFIG ─────────────────────────
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
@@ -46,7 +53,7 @@ RISK_LOOKBACK = 12
 BASE_CAPITAL = 500.0
 STATE_FILE = "adaptive_dynamic_dashboard_state.json"
 MODEL_DIR = "models"
-LIVE_MODE = True
+LIVE_MODE = env_bool("LIVE_MODE", False)
 MAX_OPEN_POSITIONS = 10
 MAX_CAPITAL_EXPOSURE = 0.60
 THREADS = 5
@@ -61,6 +68,10 @@ PERFORMANCE_SUFFIX = "_meta.json"
 os.makedirs(MODEL_DIR, exist_ok=True)
 exchange = ccxt.binance({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
 
+if LIVE_MODE and (not API_KEY or not API_SECRET):
+    print(Fore.YELLOW + "LIVE_MODE disabled: missing API credentials.")
+    LIVE_MODE = False
+
 # ───────────────────────── UTILITIES ───────────────────────
 def notify(msg):
     try:
@@ -68,6 +79,39 @@ def notify(msg):
                       data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
     except Exception:
         pass
+
+
+def safe_fetch_balance_total():
+    if not LIVE_MODE:
+        return {}
+    try:
+        return exchange.fetch_balance().get("total", {}) or {}
+    except ccxt.BaseError as e:
+        print(Fore.YELLOW + f"Balance sync skipped: {e}")
+    except Exception as e:
+        print(Fore.YELLOW + f"Balance sync error: {e}")
+    return {}
+
+
+def safe_fetch_tickers():
+    try:
+        return exchange.fetch_tickers()
+    except ccxt.BaseError as e:
+        print(Fore.YELLOW + f"Ticker fetch failed: {e}")
+    except Exception as e:
+        print(Fore.YELLOW + f"Ticker fetch error: {e}")
+    return {}
+
+
+def fetch_symbol_ohlcv(sym, limit):
+    try:
+        raw = exchange.fetch_ohlcv(sym, timeframe, limit=limit)
+        return pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
+    except ccxt.BaseError as e:
+        print(Fore.LIGHTBLACK_EX + f"Data fetch failed for {sym}: {e}")
+    except Exception as e:
+        print(Fore.LIGHTBLACK_EX + f"Data fetch error {sym}: {e}")
+    return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "vol"])
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -329,7 +373,7 @@ class SymbolModel:
 def discover_symbols():
     syms = []
     try:
-        tick = exchange.fetch_tickers()
+        tick = safe_fetch_tickers()
         for s, t in tick.items():
             if not s.endswith("/" + QUOTE):
                 continue
@@ -344,10 +388,9 @@ def discover_symbols():
 
 def fetch_btc_context():
     try:
-        df = pd.DataFrame(
-            exchange.fetch_ohlcv("BTC/USDC", timeframe, limit=slow_ema + 120),
-            columns=["ts", "open", "high", "low", "close", "vol"]
-        )
+        df = fetch_symbol_ohlcv("BTC/USDC", slow_ema + 120)
+        if df.empty:
+            raise ValueError("no btc data")
         df["atr"] = calc_atr(df, atr_period)
         ef = df["close"].ewm(span=fast_ema).mean()
         es = df["close"].ewm(span=slow_ema).mean()
@@ -402,6 +445,39 @@ def execute_sell(sym, amt):
 def clear_console():
     os.system('cls' if os.name == 'nt' else 'clear')
 
+
+def load_existing_holdings():
+    holdings = {}
+    balances = safe_fetch_balance_total()
+    if not balances:
+        return holdings
+    for asset, amt in balances.items():
+        if asset == QUOTE or amt <= 0:
+            continue
+        sym = f"{asset}/{QUOTE}"
+        try:
+            t = exchange.fetch_ticker(sym)
+            price = t["last"]
+            val = amt * price
+            if val < MIN_HOLD_VALUE:
+                continue
+            df = fetch_symbol_ohlcv(sym, 50)
+            if df.empty:
+                continue
+            df["atr"] = calc_atr(df, atr_period)
+            atr = df["atr"].iloc[-1]
+            holdings[sym] = {
+                "amount": amt,
+                "entry_price": price,
+                "stop_loss": price - ATR_SL_MULT * atr,
+                "take_profit": price + ATR_TP_MULT * atr
+            }
+            print(Fore.CYAN + f"Loaded existing {sym}: {amt:.6f} (${val:.2f})")
+        except Exception as e:
+            print(Fore.LIGHTBLACK_EX + f"Skip holding sync for {sym}: {e}")
+            continue
+    return holdings
+
 def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
     clear_console()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -442,34 +518,8 @@ def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, cur
 # ───────────────────────── MAIN LOOP ───────────────────────
 symbols = discover_symbols()
 models = {s: SymbolModel(s) for s in symbols}
-holdings = {}
+holdings = load_existing_holdings()
 print(Fore.MAGENTA + "Starting Adaptive ATR Momentum Bot v3.6 (USDC only)")
-
-# Auto-load all Binance holdings
-balances = exchange.fetch_balance().get("total", {})
-for asset, amt in balances.items():
-    if asset == QUOTE or amt <= 0:
-        continue
-    sym = f"{asset}/{QUOTE}"
-    try:
-        t = exchange.fetch_ticker(sym)
-        price = t["last"]
-        val = amt * price
-        if val < MIN_HOLD_VALUE:
-            continue
-        df = pd.DataFrame(exchange.fetch_ohlcv(sym, timeframe, limit=50),
-                          columns=["ts","open","high","low","close","vol"])
-        df["atr"] = calc_atr(df, atr_period)
-        atr = df["atr"].iloc[-1]
-        holdings[sym] = {
-            "amount": amt,
-            "entry_price": price,
-            "stop_loss": price - ATR_SL_MULT * atr,
-            "take_profit": price + ATR_TP_MULT * atr
-        }
-        print(Fore.CYAN + f"Loaded existing {sym}: {amt:.6f} (${val:.2f})")
-    except Exception:
-        continue
 
 while True:
     try:
@@ -484,9 +534,8 @@ while True:
             models.setdefault(s, SymbolModel(s))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as ex:
-            data = list(ex.map(lambda s: (s, pd.DataFrame(exchange.fetch_ohlcv(s, timeframe, limit=slow_ema + 120),
-                                                         columns=["ts","open","high","low","close","vol"])), symbols))
-        tickers = exchange.fetch_tickers()
+            data = list(ex.map(lambda s: (s, fetch_symbol_ohlcv(s, slow_ema + 120)), symbols))
+        tickers = safe_fetch_tickers()
 
         entry_threshold = dynamic_entry_threshold(btc_ctx)
         current_risk = state.get("current_risk_percent", BASE_RISK_PERCENT)
