@@ -75,9 +75,12 @@ MIN_INCREMENTAL_BATCH = int(os.getenv("MIN_INCREMENTAL_BATCH", "24"))
 BACKTEST_WINDOW = int(os.getenv("BACKTEST_WINDOW", "240"))
 BACKTEST_STEP = int(os.getenv("BACKTEST_STEP", "24"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
+TRADE_LOG_DIR = Path(os.getenv("TRADE_LOG_DIR", "Logs"))
+MAX_TRADE_LOG_DAYS = int(os.getenv("MAX_TRADE_LOG_DAYS", "60"))
 CANDLE_STALENESS_TOLERANCE = int(os.getenv("CANDLE_STALENESS_TOLERANCE", "180"))
 
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+TRADE_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 exchange = ccxt.binance({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
@@ -112,10 +115,36 @@ def log_decision(symbol, context):
     log_event("decisions", context)
 
 
+def _prune_trade_logs():
+    try:
+        logs = []
+        for path in TRADE_LOG_DIR.glob("*.log"):
+            try:
+                log_date = datetime.strptime(path.stem, "%d-%m-%Y")
+                logs.append((log_date, path))
+            except ValueError:
+                continue
+        logs.sort(reverse=True)
+        for _, old_path in logs[MAX_TRADE_LOG_DAYS:]:
+            try:
+                old_path.unlink()
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+
+
 def log_trade(event_type, symbol, context):
     payload = dict(context)
     payload.update({"symbol": symbol, "event": event_type})
-    log_event("trades", payload)
+    payload.setdefault("ts", datetime.now(datetime.UTC).isoformat())
+    try:
+        log_file = TRADE_LOG_DIR / f"{datetime.now(datetime.UTC).strftime('%d-%m-%Y')}.log"
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, default=str) + "\n")
+        _prune_trade_logs()
+    except Exception:
+        pass
 
 
 def safe_fetch_balance_total():
