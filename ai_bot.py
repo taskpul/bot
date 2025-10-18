@@ -8,6 +8,7 @@ Now includes:
 • Dynamic SL/TP and ATR trailing management
 • Live dashboard, profit tracking, Telegram alerts
 • Predictive XGBoost logic and self-learning updates
+• Adaptive risk sizing and regime-aware probability thresholds
 """
 
 import os, time, json, warnings, pandas as pd, numpy as np, ccxt, requests, concurrent.futures
@@ -36,7 +37,11 @@ timeframe = "1h"
 
 fast_ema, slow_ema, rsi_period, atr_period = 9, 21, 14, 14
 ATR_SL_MULT, ATR_TP_MULT, TRAIL_FACTOR = 2.0, 3.0, 0.6
-risk_percent = 0.10
+BASE_RISK_PERCENT = 0.10
+MIN_RISK_PERCENT = 0.05
+MAX_RISK_PERCENT = 0.20
+RISK_STEP = 0.02
+RISK_LOOKBACK = 12
 BASE_CAPITAL = 500.0
 STATE_FILE = "adaptive_dynamic_dashboard_state.json"
 MODEL_DIR = "models"
@@ -45,6 +50,10 @@ MAX_OPEN_POSITIONS = 10
 MAX_CAPITAL_EXPOSURE = 0.60
 THREADS = 5
 lock_factor = 0.5
+PROB_THRESHOLD = 0.65
+HIGH_VOLATILITY_LEVEL = 0.025
+LOW_VOLATILITY_LEVEL = 0.012
+TREND_STRENGTH_BONUS = 0.04
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 exchange = ccxt.binance({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
@@ -85,8 +94,16 @@ def load_state():
         s.setdefault("realized_profit", 0.0)
         s.setdefault("daily_profit", 0.0)
         s.setdefault("last_date", datetime.now().strftime("%Y-%m-%d"))
+        s.setdefault("trade_history", [])
+        s.setdefault("current_risk_percent", BASE_RISK_PERCENT)
         return s
-    return {"realized_profit": 0.0, "daily_profit": 0.0, "last_date": datetime.now().strftime("%Y-%m-%d")}
+    return {
+        "realized_profit": 0.0,
+        "daily_profit": 0.0,
+        "last_date": datetime.now().strftime("%Y-%m-%d"),
+        "trade_history": [],
+        "current_risk_percent": BASE_RISK_PERCENT
+    }
 
 def save_state(s):
     json.dump(s, open(STATE_FILE, "w"), indent=2)
@@ -95,6 +112,44 @@ state = load_state()
 
 def effective_capital():
     return BASE_CAPITAL + state["realized_profit"]
+
+
+def recent_trade_stats():
+    history = state.get("trade_history", [])
+    if not history:
+        return {"win_rate": 0.5, "avg_pnl": 0.0}
+    wins = sum(1 for p in history if p > 0)
+    win_rate = wins / len(history)
+    avg_pnl = float(np.mean(history))
+    return {"win_rate": win_rate, "avg_pnl": avg_pnl}
+
+
+def adjust_risk_from_history():
+    stats = recent_trade_stats()
+    current = state.get("current_risk_percent", BASE_RISK_PERCENT)
+    new_risk = current
+    if stats["avg_pnl"] > 0 and stats["win_rate"] > 0.6:
+        new_risk = min(MAX_RISK_PERCENT, current + RISK_STEP)
+    elif stats["avg_pnl"] < 0 and stats["win_rate"] < 0.4:
+        new_risk = max(MIN_RISK_PERCENT, current - RISK_STEP)
+    else:
+        # mean-revert gently toward baseline when performance is mixed
+        if current > BASE_RISK_PERCENT:
+            new_risk = max(BASE_RISK_PERCENT, current - RISK_STEP / 2)
+        elif current < BASE_RISK_PERCENT:
+            new_risk = min(BASE_RISK_PERCENT, current + RISK_STEP / 2)
+    state["current_risk_percent"] = round(new_risk, 4)
+    save_state(state)
+    return state["current_risk_percent"]
+
+
+def record_trade_pnl(pnl):
+    history = state.setdefault("trade_history", [])
+    history.append(float(pnl))
+    if len(history) > RISK_LOOKBACK:
+        del history[0:len(history) - RISK_LOOKBACK]
+    adjust_risk_from_history()
+    save_state(state)
 
 # ───────────────────────── MODEL ───────────────────────────
 class SymbolModel:
@@ -136,6 +191,11 @@ class SymbolModel:
         df.loc[:, "body_ratio"] = (df["close"] - df["open"]) / (df["high"] - df["low"] + 1e-9)
         df.loc[:, "vol_ratio"] = (df["vol"] / df["vol"].rolling(20).mean()).fillna(1)
         df.loc[:, "atr_change"] = df["atr"].pct_change().fillna(0)
+        df.loc[:, "ema_ratio"] = (df["ema_fast"] / (df["ema_slow"] + 1e-9)) - 1
+        df.loc[:, "price_momentum"] = df["close"].pct_change().rolling(5).mean().fillna(0)
+        vol_mean = df["vol"].rolling(30).mean()
+        vol_std = df["vol"].rolling(30).std().replace(0, np.nan)
+        df.loc[:, "volume_zscore"] = ((df["vol"] - vol_mean) / vol_std).fillna(0)
         return df
 
     def update(self, df):
@@ -143,7 +203,8 @@ class SymbolModel:
         X = np.column_stack([
             df["ema_fast"] - df["ema_slow"],
             df["rsi"], df["atr"] / df["close"],
-            df["body_ratio"], df["vol_ratio"], df["atr_change"]
+            df["body_ratio"], df["vol_ratio"], df["atr_change"],
+            df["ema_ratio"], df["price_momentum"], df["volume_zscore"]
         ])
         y = (df["close"].shift(-1) > df["close"]).astype(int)
         if len(X) > 40:
@@ -164,7 +225,8 @@ class SymbolModel:
             r = np.array([[
                 df["ema_fast"].iloc[-1] - df["ema_slow"].iloc[-1],
                 df["rsi"].iloc[-1], df["atr"].iloc[-1] / df["close"].iloc[-1],
-                df["body_ratio"].iloc[-1], df["vol_ratio"].iloc[-1], df["atr_change"].iloc[-1]
+                df["body_ratio"].iloc[-1], df["vol_ratio"].iloc[-1], df["atr_change"].iloc[-1],
+                df["ema_ratio"].iloc[-1], df["price_momentum"].iloc[-1], df["volume_zscore"].iloc[-1]
             ]])
             r = self.scaler.transform(r)
             return float(self.model.predict_proba(r)[0, 1])
@@ -188,15 +250,42 @@ def discover_symbols():
     print(Fore.CYAN + f"Tracking {len(syms)} high-volume {QUOTE} pairs")
     return syms
 
-def market_bullish():
+def fetch_btc_context():
     try:
-        df = pd.DataFrame(exchange.fetch_ohlcv("BTC/USDC", timeframe, limit=slow_ema + 20),
-                          columns=["ts","open","high","low","close","vol"])
-        ef = df["close"].ewm(span=fast_ema).mean().iloc[-1]
-        es = df["close"].ewm(span=slow_ema).mean().iloc[-1]
-        return ef > es
+        df = pd.DataFrame(
+            exchange.fetch_ohlcv("BTC/USDC", timeframe, limit=slow_ema + 120),
+            columns=["ts", "open", "high", "low", "close", "vol"]
+        )
+        df["atr"] = calc_atr(df, atr_period)
+        ef = df["close"].ewm(span=fast_ema).mean()
+        es = df["close"].ewm(span=slow_ema).mean()
+        bullish = bool(ef.iloc[-1] > es.iloc[-1])
+        vol_ratio = float(df["atr"].iloc[-1] / df["close"].iloc[-1])
+        trend_strength = float((ef.iloc[-1] - es.iloc[-1]) / df["close"].iloc[-1])
+        momentum = float(df["close"].pct_change().ewm(span=5).mean().iloc[-1])
+        return {
+            "bullish": bullish,
+            "volatility": max(vol_ratio, 0.0),
+            "trend_strength": trend_strength,
+            "momentum": momentum
+        }
     except Exception:
-        return True
+        return {"bullish": True, "volatility": 0.0, "trend_strength": 0.0, "momentum": 0.0}
+
+
+def dynamic_entry_threshold(btc_ctx):
+    threshold = PROB_THRESHOLD
+    vol = btc_ctx.get("volatility", 0.0)
+    trend_strength = btc_ctx.get("trend_strength", 0.0)
+    if vol > HIGH_VOLATILITY_LEVEL:
+        threshold += 0.05
+    elif vol < LOW_VOLATILITY_LEVEL:
+        threshold -= 0.03
+    if trend_strength > 0.02:
+        threshold -= TREND_STRENGTH_BONUS
+    elif trend_strength < -0.02:
+        threshold += TREND_STRENGTH_BONUS
+    return min(max(threshold, 0.5), 0.85)
 
 def execute_buy(sym, amt):
     try:
@@ -221,7 +310,7 @@ def execute_sell(sym, amt):
 def clear_console():
     os.system('cls' if os.name == 'nt' else 'clear')
 
-def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob):
+def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
     clear_console()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(Fore.MAGENTA + Style.BRIGHT + "══════════ ADAPTIVE ATR MOMENTUM BOT v3.6 DASHBOARD ══════════")
@@ -235,6 +324,9 @@ def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob):
     print(Fore.GREEN + f"Total Capital: ${total_cap:,.2f}")
     print(Fore.YELLOW + f"Used Capital:  ${used_cap:,.2f}")
     print(Fore.WHITE + f"Free Capital:  ${free_cap:,.2f}")
+    stats = recent_trade_stats()
+    print(Fore.WHITE + f"Dynamic Risk:  {current_risk*100:.1f}% (win {stats['win_rate']*100:.0f}% avgPnL {stats['avg_pnl']:+.2f})")
+    print(Fore.WHITE + f"Entry Threshold: {threshold:.2f}  BTC vol {btc_ctx.get('volatility',0):.3f} trend {btc_ctx.get('trend_strength',0):+.3f}")
     print(profit_color + f"Today's P/L:   {state['daily_profit']:+.2f} USDC")
     print(Fore.WHITE + "-"*65)
     print(Fore.CYAN + Style.BRIGHT + "CURRENT HOLDINGS")
@@ -289,7 +381,8 @@ for asset, amt in balances.items():
 
 while True:
     try:
-        if not market_bullish():
+        btc_ctx = fetch_btc_context()
+        if not btc_ctx["bullish"]:
             print(Fore.LIGHTBLACK_EX + "BTC filter blocking entries.")
             safe_sleep(interval)
             continue
@@ -302,6 +395,9 @@ while True:
             data = list(ex.map(lambda s: (s, pd.DataFrame(exchange.fetch_ohlcv(s, timeframe, limit=slow_ema + 120),
                                                          columns=["ts","open","high","low","close","vol"])), symbols))
         tickers = exchange.fetch_tickers()
+
+        entry_threshold = dynamic_entry_threshold(btc_ctx)
+        current_risk = state.get("current_risk_percent", BASE_RISK_PERCENT)
 
         best_sym, best_prob, best_price, best_atr = None, 0, 0, 0
         for sym, df in data:
@@ -316,10 +412,10 @@ while True:
             if p > best_prob:
                 best_sym, best_prob, best_price, best_atr = sym, p, price, atr
 
-        if best_sym and best_prob > 0.65 and best_sym not in holdings:
+        if best_sym and best_prob > entry_threshold and best_sym not in holdings:
             used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
             if len(holdings) < MAX_OPEN_POSITIONS and used_cap < effective_capital() * MAX_CAPITAL_EXPOSURE:
-                alloc = risk_percent * effective_capital()
+                alloc = current_risk * effective_capital()
                 amt = alloc / best_price
                 if LIVE_MODE:
                     execute_buy(best_sym, amt)
@@ -350,7 +446,7 @@ while True:
                     state["last_date"] = today
                     state["daily_profit"] = 0.0
                 state["daily_profit"] += pnl
-                save_state(state)
+                record_trade_pnl(pnl)
                 c = Fore.GREEN if pnl >= 0 else Fore.RED
                 print(c + f"EXIT {sym} PnL ${pnl:.2f} Total ${state['realized_profit']:.2f}")
                 notify(f"EXIT {sym} PnL ${pnl:.2f}")
@@ -358,7 +454,7 @@ while True:
                     execute_sell(sym, h["amount"])
                 del holdings[sym]
 
-        print_dashboard(tickers, holdings, state, interval, best_sym, best_prob)
+        print_dashboard(tickers, holdings, state, interval, best_sym, best_prob, current_risk, entry_threshold, btc_ctx)
         safe_sleep(interval)
 
     except ccxt.BaseError as e:
