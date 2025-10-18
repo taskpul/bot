@@ -15,6 +15,7 @@ import os, time, json, warnings, pandas as pd, numpy as np, ccxt, requests, conc
 from dotenv import load_dotenv
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import precision_score, recall_score
 from colorama import Fore, Style, init as color_init
 from datetime import datetime
 
@@ -54,6 +55,8 @@ PROB_THRESHOLD = 0.65
 HIGH_VOLATILITY_LEVEL = 0.025
 LOW_VOLATILITY_LEVEL = 0.012
 TREND_STRENGTH_BONUS = 0.04
+FEE_BUFFER = 0.0015
+PERFORMANCE_SUFFIX = "_meta.json"
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 exchange = ccxt.binance({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
@@ -151,15 +154,36 @@ def record_trade_pnl(pnl):
     adjust_risk_from_history()
     save_state(state)
 
+
+def volatility_risk_modifier(btc_ctx):
+    vol = btc_ctx.get("volatility", 0.0)
+    momentum = btc_ctx.get("momentum", 0.0)
+    if vol > HIGH_VOLATILITY_LEVEL * 1.6:
+        return 0.6
+    if vol > HIGH_VOLATILITY_LEVEL:
+        return 0.8
+    if vol < LOW_VOLATILITY_LEVEL / 2 and momentum > 0:
+        return 1.15
+    if vol < LOW_VOLATILITY_LEVEL:
+        return 1.05
+    return 1.0
+
 # ───────────────────────── MODEL ───────────────────────────
 class SymbolModel:
     def __init__(self, sym):
         self.sym = sym
         self.model_path = os.path.join(MODEL_DIR, f"{sym.replace('/', '_')}.json")
         self.scaler_path = os.path.join(MODEL_DIR, f"{sym.replace('/', '_')}_scaler.json")
+        self.meta_path = os.path.join(MODEL_DIR, f"{sym.replace('/', '_')}{PERFORMANCE_SUFFIX}")
         self.model = XGBClassifier(eval_metric="logloss", n_estimators=100, max_depth=3)
         self.scaler = StandardScaler()
         self.trained, self.last_train = False, 0
+        self.performance = {
+            "precision": 0.5,
+            "recall": 0.5,
+            "avg_forward_return": 0.0,
+            "threshold_bonus": 0.0
+        }
         self._load()
 
     def _load(self):
@@ -171,6 +195,8 @@ class SymbolModel:
                     self.scaler.mean_ = np.array(p["mean"])
                     self.scaler.scale_ = np.array(p["scale"])
                 self.trained = True
+            if os.path.exists(self.meta_path):
+                self.performance.update(json.load(open(self.meta_path)))
         except Exception:
             pass
 
@@ -179,6 +205,7 @@ class SymbolModel:
             self.model.save_model(self.model_path)
             json.dump({"mean": self.scaler.mean_.tolist(),
                        "scale": self.scaler.scale_.tolist()}, open(self.scaler_path, "w"))
+            json.dump(self.performance, open(self.meta_path, "w"), indent=2)
         except Exception:
             pass
 
@@ -196,6 +223,15 @@ class SymbolModel:
         vol_mean = df["vol"].rolling(30).mean()
         vol_std = df["vol"].rolling(30).std().replace(0, np.nan)
         df.loc[:, "volume_zscore"] = ((df["vol"] - vol_mean) / vol_std).fillna(0)
+        df.loc[:, "volatility_regime"] = (df["atr"] / (df["close"] + 1e-9)).rolling(20).mean().fillna(method="bfill").fillna(0)
+        df.loc[:, "trend_slope"] = (df["ema_fast"] - df["ema_slow"]).diff().fillna(0)
+        df.loc[:, "momentum_3"] = df["close"].pct_change(periods=3).fillna(0)
+        df.loc[:, "rsi_slope"] = df["rsi"].diff().fillna(0)
+        df.loc[:, "volume_trend"] = df["vol"].pct_change().rolling(3).mean().fillna(0)
+        ma20 = df["close"].rolling(20).mean()
+        std20 = df["close"].rolling(20).std().replace(0, np.nan)
+        df.loc[:, "bollinger_pos"] = ((df["close"] - ma20) / (2 * std20)).clip(-3, 3).fillna(0)
+        df = df.replace([np.inf, -np.inf], 0).fillna(0)
         return df
 
     def update(self, df):
@@ -204,15 +240,58 @@ class SymbolModel:
             df["ema_fast"] - df["ema_slow"],
             df["rsi"], df["atr"] / df["close"],
             df["body_ratio"], df["vol_ratio"], df["atr_change"],
-            df["ema_ratio"], df["price_momentum"], df["volume_zscore"]
+            df["ema_ratio"], df["price_momentum"], df["volume_zscore"],
+            df["volatility_regime"], df["trend_slope"], df["momentum_3"],
+            df["rsi_slope"], df["volume_trend"], df["bollinger_pos"]
         ])
-        y = (df["close"].shift(-1) > df["close"]).astype(int)
+        forward_returns = (df["close"].shift(-1) / df["close"]) - 1
+        y = (forward_returns > FEE_BUFFER).astype(int)
         if len(X) > 40:
             try:
                 Xs = self.scaler.fit_transform(X[:-1])
-                self.model.fit(Xs, y[:-1])
+                y_train_full = y[:-1]
+                val_size = max(10, int(len(Xs) * 0.2))
+                if len(Xs) - val_size <= 20:
+                    val_size = 0
+                if val_size:
+                    X_train, X_val = Xs[:-val_size], Xs[-val_size:]
+                    y_train, y_val = y_train_full[:-val_size], y_train_full[-val_size:]
+                else:
+                    X_train, y_train = Xs, y_train_full
+                    X_val, y_val = np.empty((0, Xs.shape[1])), np.array([])
+
+                self.model.fit(X_train, y_train)
                 self.trained = True
                 self.last_train = time.time()
+
+                if val_size and len(np.unique(y_val)) > 1:
+                    val_probs = self.model.predict_proba(X_val)[:, 1]
+                    val_preds = (val_probs >= 0.5).astype(int)
+                    precision = precision_score(y_val, val_preds, zero_division=0)
+                    recall = recall_score(y_val, val_preds, zero_division=0)
+                    avg_forward = float(np.nanmean(forward_returns[-val_size:]))
+                    bonus = 0.0
+                    if precision > 0.58:
+                        bonus -= 0.04
+                    elif precision < 0.45:
+                        bonus += 0.04
+                    if avg_forward > FEE_BUFFER * 2:
+                        bonus -= 0.02
+                    elif avg_forward < FEE_BUFFER:
+                        bonus += 0.02
+                    self.performance.update({
+                        "precision": round(float(precision), 4),
+                        "recall": round(float(recall), 4),
+                        "avg_forward_return": round(avg_forward, 6),
+                        "threshold_bonus": float(np.clip(bonus, -0.06, 0.06))
+                    })
+                else:
+                    self.performance.update({
+                        "precision": 0.5,
+                        "recall": 0.5,
+                        "avg_forward_return": float(np.nanmean(forward_returns)) if len(forward_returns) else 0.0,
+                        "threshold_bonus": 0.0
+                    })
                 self._save()
             except Exception:
                 pass
@@ -226,12 +305,25 @@ class SymbolModel:
                 df["ema_fast"].iloc[-1] - df["ema_slow"].iloc[-1],
                 df["rsi"].iloc[-1], df["atr"].iloc[-1] / df["close"].iloc[-1],
                 df["body_ratio"].iloc[-1], df["vol_ratio"].iloc[-1], df["atr_change"].iloc[-1],
-                df["ema_ratio"].iloc[-1], df["price_momentum"].iloc[-1], df["volume_zscore"].iloc[-1]
+                df["ema_ratio"].iloc[-1], df["price_momentum"].iloc[-1], df["volume_zscore"].iloc[-1],
+                df["volatility_regime"].iloc[-1], df["trend_slope"].iloc[-1], df["momentum_3"].iloc[-1],
+                df["rsi_slope"].iloc[-1], df["volume_trend"].iloc[-1], df["bollinger_pos"].iloc[-1]
             ]])
             r = self.scaler.transform(r)
             return float(self.model.predict_proba(r)[0, 1])
         except Exception:
             return 0.5
+
+    def adjusted_threshold(self, base_threshold):
+        bonus = self.performance.get("threshold_bonus", 0.0) if self.performance else 0.0
+        return min(max(base_threshold + bonus, 0.5), 0.9)
+
+    def risk_modifier(self):
+        precision = self.performance.get("precision", 0.5)
+        avg_ret = self.performance.get("avg_forward_return", 0.0)
+        modifier = 0.9 + (precision - 0.5) * 0.6
+        modifier += np.clip(avg_ret * 10, -0.1, 0.1)
+        return float(np.clip(modifier, 0.5, 1.25))
 
 # ───────────────────────── DISCOVERY & DASHBOARD ───────────
 def discover_symbols():
@@ -400,6 +492,7 @@ while True:
         current_risk = state.get("current_risk_percent", BASE_RISK_PERCENT)
 
         best_sym, best_prob, best_price, best_atr = None, 0, 0, 0
+        best_threshold, best_risk_mod = entry_threshold, 1.0
         for sym, df in data:
             if df.empty:
                 continue
@@ -409,22 +502,29 @@ while True:
                 m.update(df)
             p = m.predict(df)
             price, atr = df["close"].iloc[-1], df["atr"].iloc[-1]
+            sym_threshold = m.adjusted_threshold(entry_threshold)
+            risk_mod = m.risk_modifier()
             if p > best_prob:
                 best_sym, best_prob, best_price, best_atr = sym, p, price, atr
+                best_threshold, best_risk_mod = sym_threshold, risk_mod
 
-        if best_sym and best_prob > entry_threshold and best_sym not in holdings:
+        if best_sym and best_prob > best_threshold and best_sym not in holdings:
             used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
             if len(holdings) < MAX_OPEN_POSITIONS and used_cap < effective_capital() * MAX_CAPITAL_EXPOSURE:
-                alloc = current_risk * effective_capital()
-                amt = alloc / best_price
-                if LIVE_MODE:
-                    execute_buy(best_sym, amt)
-                holdings[best_sym] = {
-                    "amount": amt,
-                    "entry_price": best_price,
-                    "stop_loss": best_price - ATR_SL_MULT * best_atr,
-                    "take_profit": best_price + ATR_TP_MULT * best_atr
-                }
+                vol_mod = volatility_risk_modifier(btc_ctx)
+                alloc = current_risk * best_risk_mod * vol_mod * effective_capital()
+                max_alloc = max(effective_capital() * MAX_CAPITAL_EXPOSURE - used_cap, 0)
+                alloc = min(alloc, max_alloc)
+                if alloc > 0:
+                    amt = alloc / best_price
+                    if LIVE_MODE:
+                        execute_buy(best_sym, amt)
+                    holdings[best_sym] = {
+                        "amount": amt,
+                        "entry_price": best_price,
+                        "stop_loss": best_price - ATR_SL_MULT * best_atr,
+                        "take_profit": best_price + ATR_TP_MULT * best_atr
+                    }
 
         # Exit Management
         for sym, h in list(holdings.items()):
@@ -454,7 +554,7 @@ while True:
                     execute_sell(sym, h["amount"])
                 del holdings[sym]
 
-        print_dashboard(tickers, holdings, state, interval, best_sym, best_prob, current_risk, entry_threshold, btc_ctx)
+        print_dashboard(tickers, holdings, state, interval, best_sym, best_prob, current_risk, best_threshold, btc_ctx)
         safe_sleep(interval)
 
     except ccxt.BaseError as e:
