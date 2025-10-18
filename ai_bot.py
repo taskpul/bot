@@ -257,6 +257,8 @@ def _normalize_holding_entry(sym, entry, default_source="bot"):
         return None
     if amount <= 0 or price <= 0:
         return None
+    if amount * price < MIN_HOLD_VALUE:
+        return None
     normalized = {
         "amount": amount,
         "entry_price": price,
@@ -815,8 +817,9 @@ def load_existing_holdings():
     for sym, entry in snapshot.items():
         normalized = _normalize_holding_entry(sym, entry, entry.get("source", "state") if isinstance(entry, dict) else "state")
         if normalized:
+            value = normalized["amount"] * normalized["entry_price"]
             holdings[sym] = normalized
-            print(Fore.CYAN + f"Recovered {sym} from snapshot: {normalized['amount']:.6f} (${normalized['amount'] * normalized['entry_price']:.2f})")
+            print(Fore.CYAN + f"Recovered {sym} from snapshot: {normalized['amount']:.6f} (${value:.2f})")
 
     balances = safe_fetch_balance_total()
     if balances:
@@ -856,6 +859,16 @@ def sync_holdings_with_exchange(holdings):
             continue
         if amount <= 0:
             continue
+        existing_entry = holdings.get(sym)
+        if existing_entry:
+            try:
+                entry_price = float(existing_entry.get("entry_price", 0) or 0)
+            except (TypeError, ValueError):
+                entry_price = 0.0
+            if entry_price > 0 and entry_price * amount < MIN_HOLD_VALUE:
+                print(Fore.LIGHTBLACK_EX + f"Removing synced holding {sym}: value below minimum (${entry_price * amount:.2f})")
+                holdings.pop(sym, None)
+                continue
         seen.add(sym)
         if sym in holdings:
             holdings[sym]["amount"] = amount
