@@ -228,6 +228,7 @@ def load_state():
         s.setdefault("current_risk_percent", BASE_RISK_PERCENT)
         s.setdefault("expected_realized_history", [])
         s.setdefault("threshold_bias", 0.0)
+        s.setdefault("holdings_snapshot", {})
         return s
     return {
         "realized_profit": 0.0,
@@ -236,13 +237,49 @@ def load_state():
         "trade_history": [],
         "current_risk_percent": BASE_RISK_PERCENT,
         "expected_realized_history": [],
-        "threshold_bias": 0.0
+        "threshold_bias": 0.0,
+        "holdings_snapshot": {}
     }
 
 def save_state(s):
     json.dump(s, open(STATE_FILE, "w"), indent=2)
 
 state = load_state()
+
+
+def _normalize_holding_entry(sym, entry, default_source="bot"):
+    if not isinstance(entry, dict):
+        return None
+    try:
+        amount = float(entry.get("amount", 0) or 0)
+        price = float(entry.get("entry_price", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0 or price <= 0:
+        return None
+    normalized = {
+        "amount": amount,
+        "entry_price": price,
+        "stop_loss": float(entry.get("stop_loss", price) or price),
+        "take_profit": float(entry.get("take_profit", price) or price),
+        "expected_return": float(entry.get("expected_return", 0.0) or 0.0),
+        "expected_prob": float(entry.get("expected_prob", 0.0) or 0.0),
+        "expected_pnl": float(entry.get("expected_pnl", 0.0) or 0.0),
+        "entry_time": str(entry.get("entry_time", datetime.now(datetime.UTC).isoformat())),
+        "source": entry.get("source") or default_source,
+    }
+    return normalized
+
+
+def persist_holdings(holdings):
+    snapshot = {}
+    for sym, entry in holdings.items():
+        normalized = _normalize_holding_entry(sym, entry, entry.get("source", "bot") if isinstance(entry, dict) else "bot")
+        if normalized:
+            snapshot[sym] = normalized
+    if state.get("holdings_snapshot") != snapshot:
+        state["holdings_snapshot"] = snapshot
+        save_state(state)
 
 def effective_capital():
     return BASE_CAPITAL + state["realized_profit"]
@@ -774,26 +811,39 @@ def build_exchange_holding(sym, amt, price=None):
 
 def load_existing_holdings():
     holdings = {}
+    snapshot = state.get("holdings_snapshot", {}) or {}
+    for sym, entry in snapshot.items():
+        normalized = _normalize_holding_entry(sym, entry, entry.get("source", "state") if isinstance(entry, dict) else "state")
+        if normalized:
+            holdings[sym] = normalized
+            print(Fore.CYAN + f"Recovered {sym} from snapshot: {normalized['amount']:.6f} (${normalized['amount'] * normalized['entry_price']:.2f})")
+
     balances = safe_fetch_balance_total()
-    if not balances:
-        return holdings
-    for asset, amt in balances.items():
-        if asset == QUOTE:
-            continue
-        sym = f"{asset}/{QUOTE}"
-        entry = build_exchange_holding(sym, amt)
-        if entry is None:
-            continue
-        holdings[sym] = entry
-        print(Fore.CYAN + f"Loaded existing {sym}: {entry['amount']:.6f} (${entry['amount'] * entry['entry_price']:.2f})")
+    if balances:
+        for asset, amt in balances.items():
+            if asset == QUOTE:
+                continue
+            sym = f"{asset}/{QUOTE}"
+            entry = build_exchange_holding(sym, amt)
+            if entry is None:
+                continue
+            holdings[sym] = entry
+            print(Fore.CYAN + f"Loaded existing {sym}: {entry['amount']:.6f} (${entry['amount'] * entry['entry_price']:.2f})")
+
+    if holdings:
+        persist_holdings(holdings)
     return holdings
 
 
 def sync_holdings_with_exchange(holdings):
     if not LIVE_MODE:
+        if holdings:
+            persist_holdings(holdings)
         return
     balances = safe_fetch_balance_total()
     if not balances:
+        if holdings:
+            persist_holdings(holdings)
         return
     seen = set()
     for asset, amt in balances.items():
@@ -821,6 +871,7 @@ def sync_holdings_with_exchange(holdings):
         if holdings[sym].get("source") == "exchange" and sym not in seen:
             print(Fore.LIGHTBLACK_EX + f"Removing synced holding {sym}: no balance detected")
             holdings.pop(sym, None)
+    persist_holdings(holdings)
 
 def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
     clear_console()
@@ -1026,6 +1077,7 @@ while True:
                             "risk_mod": best_risk_mod,
                             "portfolio_mod": portfolio_mod
                         })
+                        persist_holdings(holdings)
 
         # Exit Management
         for sym, h in list(holdings.items()):
@@ -1074,7 +1126,9 @@ while True:
                 if LIVE_MODE:
                     execute_sell(sym, h["amount"])
                 del holdings[sym]
+                persist_holdings(holdings)
 
+        persist_holdings(holdings)
         render_status(tickers, holdings, state, interval, best_sym, best_prob, current_risk, best_threshold, btc_ctx)
         safe_sleep(interval)
 
