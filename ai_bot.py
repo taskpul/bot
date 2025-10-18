@@ -83,7 +83,17 @@ Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 TRADE_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 os.makedirs(MODEL_DIR, exist_ok=True)
-exchange = ccxt.binance({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
+exchange = ccxt.binance({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
+    "enableRateLimit": True,
+    "options": {"adjustForTimeDifference": True}
+})
+
+try:
+    exchange.load_markets()
+except Exception as e:
+    print(Fore.YELLOW + f"Market metadata load failed: {e}")
 
 if LIVE_MODE and (not API_KEY or not API_SECRET):
     print(Fore.YELLOW + "LIVE_MODE disabled: missing API credentials.")
@@ -712,41 +722,105 @@ def clear_console():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
+def build_exchange_holding(sym, amt, price=None):
+    try:
+        amount = float(amt)
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0:
+        return None
+    markets = getattr(exchange, "markets", {})
+    if sym not in markets:
+        try:
+            exchange.load_markets(reload=True)
+            markets = getattr(exchange, "markets", {})
+        except Exception:
+            markets = {}
+    if sym not in markets:
+        return None
+    try:
+        ticker = exchange.fetch_ticker(sym) if price is None else {"last": price}
+        last_price = float(ticker.get("last") or ticker.get("close") or 0.0)
+    except Exception as e:
+        print(Fore.LIGHTBLACK_EX + f"Skip holding sync for {sym}: {e}")
+        return None
+    if last_price <= 0:
+        return None
+    value = amount * last_price
+    if value < MIN_HOLD_VALUE:
+        return None
+    df = fetch_symbol_ohlcv(sym, slow_ema + 60)
+    if df.empty:
+        return None
+    df["atr"] = calc_atr(df, atr_period)
+    atr_series = df["atr"].replace([np.inf, -np.inf], np.nan).ffill()
+    atr_value = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
+    if not np.isfinite(atr_value) or atr_value <= 0:
+        atr_value = last_price * 0.02
+    atr = max(atr_value, 1e-9)
+    entry = {
+        "amount": amount,
+        "entry_price": last_price,
+        "stop_loss": last_price - ATR_SL_MULT * atr,
+        "take_profit": last_price + ATR_TP_MULT * atr,
+        "expected_return": 0.0,
+        "expected_prob": 0.0,
+        "expected_pnl": 0.0,
+        "entry_time": datetime.now(datetime.UTC).isoformat(),
+        "source": "exchange"
+    }
+    return entry
+
+
 def load_existing_holdings():
     holdings = {}
     balances = safe_fetch_balance_total()
     if not balances:
         return holdings
     for asset, amt in balances.items():
-        if asset == QUOTE or amt <= 0:
+        if asset == QUOTE:
+            continue
+        sym = f"{asset}/{QUOTE}"
+        entry = build_exchange_holding(sym, amt)
+        if entry is None:
+            continue
+        holdings[sym] = entry
+        print(Fore.CYAN + f"Loaded existing {sym}: {entry['amount']:.6f} (${entry['amount'] * entry['entry_price']:.2f})")
+    return holdings
+
+
+def sync_holdings_with_exchange(holdings):
+    if not LIVE_MODE:
+        return
+    balances = safe_fetch_balance_total()
+    if not balances:
+        return
+    seen = set()
+    for asset, amt in balances.items():
+        if asset == QUOTE:
             continue
         sym = f"{asset}/{QUOTE}"
         try:
-            t = exchange.fetch_ticker(sym)
-            price = t["last"]
-            val = amt * price
-            if val < MIN_HOLD_VALUE:
-                continue
-            df = fetch_symbol_ohlcv(sym, 50)
-            if df.empty:
-                continue
-            df["atr"] = calc_atr(df, atr_period)
-            atr = df["atr"].iloc[-1]
-            holdings[sym] = {
-                "amount": amt,
-                "entry_price": price,
-                "stop_loss": price - ATR_SL_MULT * atr,
-                "take_profit": price + ATR_TP_MULT * atr,
-                "expected_return": 0.0,
-                "expected_prob": 0.0,
-                "expected_pnl": 0.0,
-                "entry_time": datetime.now(datetime.UTC).isoformat()
-            }
-            print(Fore.CYAN + f"Loaded existing {sym}: {amt:.6f} (${val:.2f})")
-        except Exception as e:
-            print(Fore.LIGHTBLACK_EX + f"Skip holding sync for {sym}: {e}")
+            amount = float(amt)
+        except (TypeError, ValueError):
             continue
-    return holdings
+        if amount <= 0:
+            continue
+        seen.add(sym)
+        if sym in holdings:
+            holdings[sym]["amount"] = amount
+            if "source" not in holdings[sym]:
+                holdings[sym]["source"] = "exchange"
+        else:
+            entry = build_exchange_holding(sym, amount)
+            if entry is None:
+                continue
+            holdings[sym] = entry
+            print(Fore.CYAN + f"Synced new holding {sym}: {entry['amount']:.6f} (${entry['amount'] * entry['entry_price']:.2f})")
+    for sym in list(holdings.keys()):
+        if holdings[sym].get("source") == "exchange" and sym not in seen:
+            print(Fore.LIGHTBLACK_EX + f"Removing synced holding {sym}: no balance detected")
+            holdings.pop(sym, None)
 
 def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
     clear_console()
@@ -839,6 +913,7 @@ else:
 
 while True:
     try:
+        sync_holdings_with_exchange(holdings)
         btc_ctx = fetch_btc_context()
         if not btc_ctx["bullish"]:
             print(Fore.LIGHTBLACK_EX + "BTC filter blocking entries.")
@@ -937,7 +1012,8 @@ while True:
                             "expected_return": best_expected,
                             "expected_prob": best_prob,
                             "expected_pnl": expected_pnl,
-                            "entry_time": datetime.now(datetime.UTC).isoformat()
+                            "entry_time": datetime.now(datetime.UTC).isoformat(),
+                            "source": "bot"
                         }
                         log_trade("entry", best_sym, {
                             "amount": amt,
