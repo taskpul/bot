@@ -98,7 +98,7 @@ def notify(msg):
 def log_event(name, payload):
     try:
         payload = dict(payload)
-        payload.setdefault("ts", datetime.utcnow().isoformat())
+        payload.setdefault("ts", datetime.now(datetime.UTC).isoformat())
         log_path = Path(LOG_DIR) / f"{name}.jsonl"
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, default=str) + "\n")
@@ -711,7 +711,7 @@ def load_existing_holdings():
                 "expected_return": 0.0,
                 "expected_prob": 0.0,
                 "expected_pnl": 0.0,
-                "entry_time": datetime.utcnow().isoformat()
+                "entry_time": datetime.now(datetime.UTC).isoformat()
             }
             print(Fore.CYAN + f"Loaded existing {sym}: {amt:.6f} (${val:.2f})")
         except Exception as e:
@@ -908,7 +908,7 @@ while True:
                             "expected_return": best_expected,
                             "expected_prob": best_prob,
                             "expected_pnl": expected_pnl,
-                            "entry_time": datetime.utcnow().isoformat()
+                            "entry_time": datetime.now(datetime.UTC).isoformat()
                         }
                         log_trade("entry", best_sym, {
                             "amount": amt,
@@ -950,7 +950,9 @@ while True:
                 if h.get("entry_time"):
                     try:
                         entry_dt = datetime.fromisoformat(h["entry_time"])
-                        hold_duration = (datetime.utcnow() - entry_dt).total_seconds()
+                        if entry_dt.tzinfo is None:
+                            entry_dt = entry_dt.replace(tzinfo=datetime.UTC)
+                        hold_duration = (datetime.now(datetime.UTC) - entry_dt).total_seconds()
                     except Exception:
                         hold_duration = None
                 c = Fore.GREEN if pnl >= 0 else Fore.RED
