@@ -17,7 +17,7 @@ from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import precision_score, recall_score
 from colorama import Fore, Style, init as color_init
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -111,7 +111,7 @@ def notify(msg):
 def log_event(name, payload):
     try:
         payload = dict(payload)
-        payload.setdefault("ts", datetime.now(datetime.UTC).isoformat())
+        payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
         log_path = Path(LOG_DIR) / f"{name}.jsonl"
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, default=str) + "\n")
@@ -147,9 +147,9 @@ def _prune_trade_logs():
 def log_trade(event_type, symbol, context):
     payload = dict(context)
     payload.update({"symbol": symbol, "event": event_type})
-    payload.setdefault("ts", datetime.now(datetime.UTC).isoformat())
+    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
     try:
-        log_file = TRADE_LOG_DIR / f"{datetime.now(datetime.UTC).strftime('%d-%m-%Y')}.log"
+        log_file = TRADE_LOG_DIR / f"{datetime.now(timezone.utc).strftime('%d-%m-%Y')}.log"
         with log_file.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, default=str) + "\n")
         _prune_trade_logs()
@@ -265,7 +265,7 @@ def _normalize_holding_entry(sym, entry, default_source="bot"):
         "expected_return": float(entry.get("expected_return", 0.0) or 0.0),
         "expected_prob": float(entry.get("expected_prob", 0.0) or 0.0),
         "expected_pnl": float(entry.get("expected_pnl", 0.0) or 0.0),
-        "entry_time": str(entry.get("entry_time", datetime.now(datetime.UTC).isoformat())),
+        "entry_time": str(entry.get("entry_time", datetime.now(timezone.utc).isoformat())),
         "source": entry.get("source") or default_source,
     }
     return normalized
@@ -803,7 +803,7 @@ def build_exchange_holding(sym, amt, price=None):
         "expected_return": 0.0,
         "expected_prob": 0.0,
         "expected_pnl": 0.0,
-        "entry_time": datetime.now(datetime.UTC).isoformat(),
+        "entry_time": datetime.now(timezone.utc).isoformat(),
         "source": "exchange"
     }
     return entry
@@ -1063,7 +1063,7 @@ while True:
                             "expected_return": best_expected,
                             "expected_prob": best_prob,
                             "expected_pnl": expected_pnl,
-                            "entry_time": datetime.now(datetime.UTC).isoformat(),
+                            "entry_time": datetime.now(timezone.utc).isoformat(),
                             "source": "bot"
                         }
                         log_trade("entry", best_sym, {
@@ -1108,8 +1108,8 @@ while True:
                     try:
                         entry_dt = datetime.fromisoformat(h["entry_time"])
                         if entry_dt.tzinfo is None:
-                            entry_dt = entry_dt.replace(tzinfo=datetime.UTC)
-                        hold_duration = (datetime.now(datetime.UTC) - entry_dt).total_seconds()
+                            entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                        hold_duration = (datetime.now(timezone.utc) - entry_dt).total_seconds()
                     except Exception:
                         hold_duration = None
                 c = Fore.GREEN if pnl >= 0 else Fore.RED
