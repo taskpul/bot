@@ -54,6 +54,7 @@ BASE_CAPITAL = 500.0
 STATE_FILE = "adaptive_dynamic_dashboard_state.json"
 MODEL_DIR = "models"
 LIVE_MODE = env_bool("LIVE_MODE", False)
+DEBUG_MODE = env_bool("DEBUG_MODE", False)
 MAX_OPEN_POSITIONS = 10
 MAX_CAPITAL_EXPOSURE = 0.60
 THREADS = 5
@@ -515,11 +516,50 @@ def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, cur
     print(Fore.WHITE + "-"*65)
     print(Fore.LIGHTBLACK_EX + "Press CTRL+C to exit.\n")
 
+
+def print_debug_status(tickers, holdings, state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_cap = effective_capital()
+    used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
+    free_cap = total_cap - used_cap
+    stats = recent_trade_stats()
+    summary = (
+        f"[{now}] Next run in {interval}s | Holdings: {len(holdings)} | Free cap: ${free_cap:,.2f} | "
+        f"Risk: {current_risk*100:.1f}% (win {stats['win_rate']*100:.0f}% avgPnL {stats['avg_pnl']:+.2f}) | "
+        f"Threshold: {threshold:.2f} | BTC vol {btc_ctx.get('volatility',0):.3f} trend {btc_ctx.get('trend_strength',0):+.3f}"
+    )
+    print(Fore.CYAN + summary)
+    if next_sym:
+        print(Fore.BLUE + f"  Next target: {next_sym} (prob {next_prob:.2f})")
+    else:
+        print(Fore.LIGHTBLACK_EX + "  No qualifying entry signal yet.")
+    if holdings:
+        print(Fore.CYAN + "  Holdings snapshot:")
+        for sym, h in holdings.items():
+            if sym not in tickers:
+                continue
+            price = tickers[sym]["last"]
+            pnl = (price - h["entry_price"]) * h["amount"]
+            color = Fore.GREEN if pnl >= 0 else Fore.RED
+            print(color + f"    {sym:<10} price {price:.4f} pnl {pnl:+.2f} sl {h['stop_loss']:.4f} tp {h['take_profit']:.4f}")
+    print(Fore.WHITE + "-"*65)
+
+
+def render_status(*args, **kwargs):
+    if DEBUG_MODE:
+        print_debug_status(*args, **kwargs)
+    else:
+        print_dashboard(*args, **kwargs)
+
 # ───────────────────────── MAIN LOOP ───────────────────────
 symbols = discover_symbols()
 models = {s: SymbolModel(s) for s in symbols}
 holdings = load_existing_holdings()
 print(Fore.MAGENTA + "Starting Adaptive ATR Momentum Bot v3.6 (USDC only)")
+if DEBUG_MODE:
+    print(Fore.YELLOW + "DEBUG_MODE enabled: streaming loop logs instead of dashboard UI.")
+else:
+    print(Fore.YELLOW + "Dashboard mode active. Set DEBUG_MODE=1 to view streaming logs.")
 
 while True:
     try:
@@ -603,7 +643,7 @@ while True:
                     execute_sell(sym, h["amount"])
                 del holdings[sym]
 
-        print_dashboard(tickers, holdings, state, interval, best_sym, best_prob, current_risk, best_threshold, btc_ctx)
+        render_status(tickers, holdings, state, interval, best_sym, best_prob, current_risk, best_threshold, btc_ctx)
         safe_sleep(interval)
 
     except ccxt.BaseError as e:
