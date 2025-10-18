@@ -268,7 +268,7 @@ class SymbolModel:
         vol_mean = df["vol"].rolling(30).mean()
         vol_std = df["vol"].rolling(30).std().replace(0, np.nan)
         df.loc[:, "volume_zscore"] = ((df["vol"] - vol_mean) / vol_std).fillna(0)
-        df.loc[:, "volatility_regime"] = (df["atr"] / (df["close"] + 1e-9)).rolling(20).mean().fillna(method="bfill").fillna(0)
+        df.loc[:, "volatility_regime"] = (df["atr"] / (df["close"] + 1e-9)).rolling(20).mean().bfill().fillna(0)
         df.loc[:, "trend_slope"] = (df["ema_fast"] - df["ema_slow"]).diff().fillna(0)
         df.loc[:, "momentum_3"] = df["close"].pct_change(periods=3).fillna(0)
         df.loc[:, "rsi_slope"] = df["rsi"].diff().fillna(0)
