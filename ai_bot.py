@@ -1112,13 +1112,15 @@ while True:
                     continue
             decision_context["status"] = "candidate"
             log_decision(sym, decision_context)
-            score = float(p * max(net_expected, 1e-6))
+            score = float(p) if AGGRESSIVE_MODE else float(p * max(net_expected, 1e-6))
             if score > best_score:
                 best_sym, best_score = sym, score
                 best_prob, best_price, best_atr = p, price, atr
                 best_threshold, best_risk_mod, best_expected = sym_threshold, risk_mod, net_expected
+                if AGGRESSIVE_MODE:
+                    best_threshold = 0.52
 
-        if best_sym and best_prob > best_threshold and best_sym not in holdings:
+        if best_sym and (AGGRESSIVE_MODE or best_prob > best_threshold) and best_sym not in holdings:
             corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
             if AGGRESSIVE_MODE or corr < MAX_SYMBOL_CORRELATION:
                 used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
