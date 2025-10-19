@@ -55,6 +55,7 @@ BASE_CAPITAL = 1200.0
 STATE_FILE = "adaptive_dynamic_dashboard_state.json"
 MODEL_DIR = "models"
 LIVE_MODE = env_bool("LIVE_MODE", False)
+DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", False)
 DEBUG_MODE = env_bool("DEBUG_MODE", False)
 MAX_OPEN_POSITIONS = 5
 MAX_CAPITAL_EXPOSURE = 0.40
@@ -1025,10 +1026,11 @@ while True:
     try:
         sync_holdings_with_exchange(holdings)
         btc_ctx = fetch_btc_context()
-        if (not btc_ctx["bullish"]) and btc_ctx["trend_strength"] < -0.01:
-            print(Fore.LIGHTBLACK_EX + "BTC downtrend — blocking entries.")
-            safe_sleep(interval)
-            continue
+        if not DISABLE_BTC_FILTER:
+            if (not btc_ctx["bullish"]) and btc_ctx["trend_strength"] < -0.01:
+                print(Fore.LIGHTBLACK_EX + "BTC downtrend — blocking entries.")
+                safe_sleep(interval)
+                continue
 
         symbols = discover_symbols()
         for s in symbols:
