@@ -55,7 +55,7 @@ BASE_CAPITAL = 1200.0
 STATE_FILE = "adaptive_dynamic_dashboard_state.json"
 MODEL_DIR = "models"
 LIVE_MODE = env_bool("LIVE_MODE", False)
-DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", False)
+DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", True)
 DEBUG_MODE = env_bool("DEBUG_MODE", False)
 AGGRESSIVE_MODE = DISABLE_BTC_FILTER
 MAX_OPEN_POSITIONS = 5
@@ -340,6 +340,8 @@ def record_expected_vs_realized(expected, realized):
 
 
 def volatility_risk_modifier(btc_ctx):
+    if DISABLE_BTC_FILTER:
+        return 1.0
     vol = btc_ctx.get("volatility", 0.0)
     momentum = btc_ctx.get("momentum", 0.0)
     if vol > HIGH_VOLATILITY_LEVEL * 1.6:
@@ -726,6 +728,9 @@ def fetch_btc_context():
 
 def dynamic_entry_threshold(btc_ctx):
     threshold = PROB_THRESHOLD
+    if DISABLE_BTC_FILTER:
+        threshold += state.get("threshold_bias", 0.0)
+        return min(max(threshold, 0.5), 0.9)
     vol = btc_ctx.get("volatility", 0.0)
     trend_strength = btc_ctx.get("trend_strength", 0.0)
     if vol > HIGH_VOLATILITY_LEVEL:
@@ -1036,7 +1041,15 @@ else:
 while True:
     try:
         sync_holdings_with_exchange(holdings)
-        btc_ctx = fetch_btc_context()
+        if DISABLE_BTC_FILTER:
+            btc_ctx = {
+                "bullish": True,
+                "volatility": LOW_VOLATILITY_LEVEL,
+                "trend_strength": 0.0,
+                "momentum": 0.0,
+            }
+        else:
+            btc_ctx = fetch_btc_context()
         if not DISABLE_BTC_FILTER:
             if (not btc_ctx["bullish"]) and btc_ctx["trend_strength"] < -0.01:
                 print(Fore.LIGHTBLACK_EX + "BTC downtrend — blocking entries.")
