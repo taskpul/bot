@@ -979,8 +979,8 @@ while True:
     try:
         sync_holdings_with_exchange(holdings)
         btc_ctx = fetch_btc_context()
-        if not btc_ctx["bullish"]:
-            print(Fore.LIGHTBLACK_EX + "BTC filter blocking entries.")
+        if (not btc_ctx["bullish"]) and btc_ctx["trend_strength"] < -0.01:
+            print(Fore.LIGHTBLACK_EX + "BTC downtrend — blocking entries.")
             safe_sleep(interval)
             continue
 
