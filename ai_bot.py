@@ -1062,6 +1062,8 @@ while True:
 
         best_sym, best_score, best_prob, best_price, best_atr = None, -np.inf, 0, 0, 0
         best_threshold, best_risk_mod, best_expected = entry_threshold, 1.0, 0.0
+        if AGGRESSIVE_MODE:
+            best_threshold = 0.52
         for sym, df in data:
             if df.empty:
                 log_decision(sym, {"reason": "no_data"})
@@ -1117,8 +1119,6 @@ while True:
                 best_sym, best_score = sym, score
                 best_prob, best_price, best_atr = p, price, atr
                 best_threshold, best_risk_mod, best_expected = sym_threshold, risk_mod, net_expected
-                if AGGRESSIVE_MODE:
-                    best_threshold = 0.52
 
         if best_sym and (AGGRESSIVE_MODE or best_prob > best_threshold) and best_sym not in holdings:
             corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
