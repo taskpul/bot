@@ -57,11 +57,12 @@ MODEL_DIR = "models"
 LIVE_MODE = env_bool("LIVE_MODE", False)
 DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", False)
 DEBUG_MODE = env_bool("DEBUG_MODE", False)
+AGGRESSIVE_MODE = DISABLE_BTC_FILTER
 MAX_OPEN_POSITIONS = 5
 MAX_CAPITAL_EXPOSURE = 0.40
 THREADS = 5
 lock_factor = 0.5
-PROB_THRESHOLD = 0.60
+PROB_THRESHOLD = 0.52 if DISABLE_BTC_FILTER else 0.60
 HIGH_VOLATILITY_LEVEL = 0.025
 LOW_VOLATILITY_LEVEL = 0.012
 TREND_STRENGTH_BONUS = 0.04
@@ -739,6 +740,11 @@ def dynamic_entry_threshold(btc_ctx):
     return min(max(threshold, 0.5), 0.9)
 
 def execute_buy(sym, amt):
+    if AGGRESSIVE_MODE:
+        order = exchange.create_market_buy_order(sym, amt)
+        print(Fore.GREEN + f"BUY {sym} {amt:.4f} (aggressive)")
+        notify(f"BUY {sym} {amt:.4f} (aggressive)")
+        return order
     try:
         for attempt in range(2):
             ticker = exchange.fetch_ticker(sym)
@@ -772,6 +778,11 @@ def execute_buy(sym, amt):
         return None
 
 def execute_sell(sym, amt):
+    if AGGRESSIVE_MODE:
+        order = exchange.create_market_sell_order(sym, amt)
+        print(Fore.GREEN + f"SELL {sym} {amt:.4f} (aggressive)")
+        notify(f"SELL {sym} {amt:.4f} (aggressive)")
+        return order
     try:
         for attempt in range(2):
             ticker = exchange.fetch_ticker(sym)
@@ -1080,18 +1091,25 @@ while True:
                 "walk_precision": round(float(walk_precision), 4),
                 "correlation": round(float(corr), 4)
             }
-            if net_expected <= 0:
-                decision_context["status"] = "skip_low_expectation"
-                log_decision(sym, decision_context)
-                continue
-            if walk_precision < 0.45:
-                decision_context["status"] = "skip_validation"
-                log_decision(sym, decision_context)
-                continue
-            if corr >= MAX_SYMBOL_CORRELATION:
-                decision_context["status"] = "skip_correlation"
-                log_decision(sym, decision_context)
-                continue
+            if not AGGRESSIVE_MODE:
+                if net_expected <= 0:
+                    decision_context["status"] = "skip_low_expectation"
+                    log_decision(sym, decision_context)
+                    continue
+                if walk_precision < 0.45:
+                    decision_context["status"] = "skip_validation"
+                    log_decision(sym, decision_context)
+                    continue
+                if corr >= MAX_SYMBOL_CORRELATION:
+                    decision_context["status"] = "skip_correlation"
+                    log_decision(sym, decision_context)
+                    continue
+            else:
+                # Aggressive mode – trade like the old bot
+                if p < 0.52:
+                    decision_context["status"] = "skip_low_prob"
+                    log_decision(sym, decision_context)
+                    continue
             decision_context["status"] = "candidate"
             log_decision(sym, decision_context)
             score = float(p * max(net_expected, 1e-6))
