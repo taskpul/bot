@@ -41,11 +41,11 @@ QUOTE = "USDC"
 TOP_N = 15
 MIN_VOLUME = 100_000
 MIN_HOLD_VALUE = 2.0
-interval = 120
-timeframe = "1h"
+interval = 60
+timeframe = "30m"
 
 fast_ema, slow_ema, rsi_period, atr_period = 9, 21, 14, 14
-ATR_SL_MULT, ATR_TP_MULT, TRAIL_FACTOR = 2.0, 3.0, 0.6
+ATR_SL_MULT, ATR_TP_MULT, TRAIL_FACTOR = 1.8, 4.0, 0.6
 BASE_RISK_PERCENT = 0.015
 MIN_RISK_PERCENT = 0.02
 MAX_RISK_PERCENT = 0.03
@@ -739,20 +739,66 @@ def dynamic_entry_threshold(btc_ctx):
 
 def execute_buy(sym, amt):
     try:
-        o = exchange.create_market_buy_order(sym, amt)
-        print(Fore.GREEN + f"BUY {sym} {amt:.4f}")
-        notify(f"BUY {sym} {amt:.4f}")
-        return o
+        for attempt in range(2):
+            ticker = exchange.fetch_ticker(sym)
+            current_price = float(ticker.get("last") or ticker.get("close") or ticker.get("bid") or ticker.get("ask") or 0.0)
+            if current_price <= 0:
+                raise ValueError("Invalid price for buy order")
+            target_price = current_price * 0.9995
+            order = exchange.create_limit_buy_order(sym, amt, target_price)
+            start = time.time()
+            while time.time() - start < 60:
+                try:
+                    status = exchange.fetch_order(order["id"], sym)
+                except Exception:
+                    time.sleep(2)
+                    continue
+                order_status = str(status.get("status", "")).lower()
+                filled = float(status.get("filled") or 0.0)
+                amount = float(status.get("amount") or 0.0)
+                if order_status == "closed" or (amount and filled >= amount):
+                    print(Fore.GREEN + f"BUY {sym} {amt:.4f}")
+                    notify(f"BUY {sym} {amt:.4f}")
+                    return status
+                time.sleep(2)
+            try:
+                exchange.cancel_order(order["id"], sym)
+            except Exception:
+                pass
+        print(Fore.YELLOW + f"BUY skipped {sym} {amt:.4f} (limit not filled)")
     except Exception as e:
         print(Fore.RED + f"BUY error {sym}: {e}")
         return None
 
 def execute_sell(sym, amt):
     try:
-        o = exchange.create_market_sell_order(sym, amt)
-        print(Fore.GREEN + f"SELL {sym} {amt:.4f}")
-        notify(f"SELL {sym} {amt:.4f}")
-        return o
+        for attempt in range(2):
+            ticker = exchange.fetch_ticker(sym)
+            current_price = float(ticker.get("last") or ticker.get("close") or ticker.get("bid") or ticker.get("ask") or 0.0)
+            if current_price <= 0:
+                raise ValueError("Invalid price for sell order")
+            target_price = current_price * 1.0005
+            order = exchange.create_limit_sell_order(sym, amt, target_price)
+            start = time.time()
+            while time.time() - start < 60:
+                try:
+                    status = exchange.fetch_order(order["id"], sym)
+                except Exception:
+                    time.sleep(2)
+                    continue
+                order_status = str(status.get("status", "")).lower()
+                filled = float(status.get("filled") or 0.0)
+                amount = float(status.get("amount") or 0.0)
+                if order_status == "closed" or (amount and filled >= amount):
+                    print(Fore.GREEN + f"SELL {sym} {amt:.4f}")
+                    notify(f"SELL {sym} {amt:.4f}")
+                    return status
+                time.sleep(2)
+            try:
+                exchange.cancel_order(order["id"], sym)
+            except Exception:
+                pass
+        print(Fore.YELLOW + f"SELL skipped {sym} {amt:.4f} (limit not filled)")
     except Exception as e:
         print(Fore.RED + f"SELL error {sym}: {e}")
         return None
