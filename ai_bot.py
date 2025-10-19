@@ -1055,15 +1055,13 @@ while True:
             if held_sym not in data_dict:
                 data_dict[held_sym] = fetch_symbol_ohlcv(held_sym, slow_ema + 120)
 
-        entry_threshold = dynamic_entry_threshold(btc_ctx)
+        entry_threshold = 0.52 if AGGRESSIVE_MODE else dynamic_entry_threshold(btc_ctx)
         current_risk = state.get("current_risk_percent", BASE_RISK_PERCENT)
         portfolio_mod = portfolio_risk_adjustment(holdings, data_dict)
         state["last_portfolio_modifier"] = portfolio_mod
 
         best_sym, best_score, best_prob, best_price, best_atr = None, -np.inf, 0, 0, 0
         best_threshold, best_risk_mod, best_expected = entry_threshold, 1.0, 0.0
-        if AGGRESSIVE_MODE:
-            best_threshold = 0.52
         for sym, df in data:
             if df.empty:
                 log_decision(sym, {"reason": "no_data"})
@@ -1106,26 +1104,21 @@ while True:
                     decision_context["status"] = "skip_correlation"
                     log_decision(sym, decision_context)
                     continue
-            else:
-                # Aggressive mode – trade like the old bot
-                if p < 0.52:
-                    decision_context["status"] = "skip_low_prob"
-                    log_decision(sym, decision_context)
-                    continue
             decision_context["status"] = "candidate"
             log_decision(sym, decision_context)
             score = float(p) if AGGRESSIVE_MODE else float(p * max(net_expected, 1e-6))
             if score > best_score:
                 best_sym, best_score = sym, score
                 best_prob, best_price, best_atr = p, price, atr
-                best_threshold, best_risk_mod, best_expected = sym_threshold, risk_mod, net_expected
+                best_threshold = 0.52 if AGGRESSIVE_MODE else sym_threshold
+                best_risk_mod, best_expected = risk_mod, net_expected
 
-        if best_sym and (AGGRESSIVE_MODE or best_prob > best_threshold) and best_sym not in holdings:
+        if best_sym and best_sym not in holdings and (AGGRESSIVE_MODE or best_prob > best_threshold):
             corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
             if AGGRESSIVE_MODE or corr < MAX_SYMBOL_CORRELATION:
                 used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
                 if len(holdings) < MAX_OPEN_POSITIONS and used_cap < effective_capital() * MAX_CAPITAL_EXPOSURE:
-                    vol_mod = volatility_risk_modifier(btc_ctx)
+                    vol_mod = 1.0 if AGGRESSIVE_MODE else volatility_risk_modifier(btc_ctx)
                     alloc = current_risk * best_risk_mod * vol_mod * portfolio_mod * effective_capital()
                     max_alloc = max(effective_capital() * MAX_CAPITAL_EXPOSURE - used_cap, 0)
                     alloc = min(alloc, max_alloc)
