@@ -1120,9 +1120,7 @@ while True:
 
         if best_sym and best_prob > best_threshold and best_sym not in holdings:
             corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
-            if corr >= MAX_SYMBOL_CORRELATION:
-                log_decision(best_sym, {"reason": "blocked_correlation", "correlation": corr})
-            else:
+            if AGGRESSIVE_MODE or corr < MAX_SYMBOL_CORRELATION:
                 used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
                 if len(holdings) < MAX_OPEN_POSITIONS and used_cap < effective_capital() * MAX_CAPITAL_EXPOSURE:
                     vol_mod = volatility_risk_modifier(btc_ctx)
@@ -1157,6 +1155,8 @@ while True:
                             "portfolio_mod": portfolio_mod
                         })
                         persist_holdings(holdings)
+            else:
+                log_decision(best_sym, {"reason": "blocked_correlation", "correlation": corr})
 
         # Exit Management
         for sym, h in list(holdings.items()):
