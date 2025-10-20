@@ -1688,16 +1688,18 @@ def run_dip_buy_engine():
             safe_sleep(30)
 
 
-try:
-    from telegram_dashboard import ensure_started as _ensure_dashboard_started
+def ensure_dashboard_started():
+    try:
+        from telegram_dashboard import ensure_started as _ensure_dashboard_started
 
-    _ensure_dashboard_started()
-except Exception as exc:
-    print(Fore.YELLOW + f"[CONTROL] Telegram dashboard unavailable: {exc}")
+        _ensure_dashboard_started()
+    except Exception as exc:
+        print(Fore.YELLOW + f"[CONTROL] Telegram dashboard unavailable: {exc}")
 
 
 def main():
     print(Fore.MAGENTA + "Starting Adaptive ATR Momentum Bot v3.6 (Dual Engine)")
+    ensure_dashboard_started()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
             executor.submit(run_momentum_engine),
