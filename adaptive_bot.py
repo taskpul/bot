@@ -11,7 +11,7 @@ Now includes:
 • Adaptive risk sizing and regime-aware probability thresholds
 """
 
-import os, time, json, warnings, pandas as pd, numpy as np, ccxt, requests, concurrent.futures, threading
+import os, sys, time, json, warnings, pandas as pd, numpy as np, ccxt, requests, concurrent.futures, threading
 from copy import deepcopy
 from dotenv import load_dotenv
 from xgboost import XGBClassifier
@@ -31,6 +31,52 @@ def env_bool(name, default=False):
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def pause_engines(reason=None):
+    global _pause_reason
+    with _pause_reason_lock:
+        if reason:
+            _pause_reason = str(reason)
+        else:
+            _pause_reason = "Paused by operator"
+    RUNNING.clear()
+    print(Fore.YELLOW + "[CONTROL] Engines paused")
+
+
+def resume_engines():
+    global _pause_reason
+    RUNNING.set()
+    with _pause_reason_lock:
+        _pause_reason = None
+    print(Fore.GREEN + "[CONTROL] Engines resumed")
+
+
+def is_running():
+    return RUNNING.is_set()
+
+
+def pause_status():
+    with _pause_reason_lock:
+        return None if RUNNING.is_set() else (_pause_reason or "Paused")
+
+
+def request_restart(delay=2.0):
+    if RESTART_REQUESTED.is_set():
+        return
+    RESTART_REQUESTED.set()
+
+    def _do_restart():
+        pause_engines("Restart requested")
+        time.sleep(max(delay, 0.5))
+        try:
+            python = sys.executable
+            args = [python] + sys.argv
+            os.execv(python, args)
+        except Exception as exc:
+            print(Fore.RED + f"[CONTROL] Restart failed: {exc}")
+
+    threading.Thread(target=_do_restart, daemon=True).start()
 
 # ───────────────────────── CONFIG ─────────────────────────
 API_KEY = os.getenv("API_KEY")
@@ -105,6 +151,12 @@ except Exception as e:
 if LIVE_MODE and (not API_KEY or not API_SECRET):
     print(Fore.YELLOW + "LIVE_MODE disabled: missing API credentials.")
     LIVE_MODE = False
+
+RUNNING = threading.Event()
+RUNNING.set()
+RESTART_REQUESTED = threading.Event()
+_pause_reason_lock = threading.RLock()
+_pause_reason = None
 
 # ───────────────────────── UTILITIES ───────────────────────
 def notify(msg):
@@ -1250,6 +1302,8 @@ def run_momentum_engine():
         print(Fore.YELLOW + "[MOMENTUM] Dashboard mode active. Set DEBUG_MODE=1 to view streaming logs.")
     last_heartbeat = 0.0
     while True:
+        if not RUNNING.wait(timeout=5):
+            continue
         try:
             now = time.time()
             if now - last_heartbeat >= 3600:
@@ -1464,6 +1518,8 @@ def run_momentum_engine():
 def run_dip_buy_engine():
     print(Fore.MAGENTA + "Starting Volatility-Adaptive Dip-Buy Engine")
     while True:
+        if not RUNNING.wait(timeout=5):
+            continue
         try:
             with momentum_holdings_lock:
                 momentum_snapshot = snapshot_holdings(momentum_holdings)
@@ -1630,6 +1686,14 @@ def run_dip_buy_engine():
         except Exception as e:
             print(Fore.RED + f"[DIP] Runtime error: {e}")
             safe_sleep(30)
+
+
+try:
+    from telegram_dashboard import ensure_started as _ensure_dashboard_started
+
+    _ensure_dashboard_started()
+except Exception as exc:
+    print(Fore.YELLOW + f"[CONTROL] Telegram dashboard unavailable: {exc}")
 
 
 def main():
