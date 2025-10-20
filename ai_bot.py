@@ -164,6 +164,30 @@ def log_trade(event_type, symbol, context):
         pass
 
 
+def _paper_trade(event_type, symbol, amount, price=None, reason=None):
+    context = {
+        "mode": "paper",
+        "amount": amount,
+        "price": price,
+    }
+    if reason:
+        context["reason"] = reason
+    log_trade(event_type, symbol, context)
+    price_text = f" @ {price:.4f}" if isinstance(price, (int, float)) and price else ""
+    tag = "BUY" if "buy" in event_type.lower() else "SELL"
+    print(Fore.CYAN + f"[PAPER {tag.upper()}] {symbol} {amount:.6f}{price_text}")
+    return {
+        "id": f"paper-{event_type}-{int(time.time() * 1000)}",
+        "symbol": symbol,
+        "amount": amount,
+        "price": price,
+        "status": "closed",
+        "filled": amount,
+        "type": "paper",
+        "side": tag.lower(),
+    }
+
+
 def apply_uniform_risk_controls(position, current_price):
     try:
         entry_price = float(position.get("entry_price", 0) or 0)
@@ -874,7 +898,16 @@ def dynamic_entry_threshold(btc_ctx):
     threshold += state.get("threshold_bias", 0.0)
     return min(max(threshold, 0.5), 0.9)
 
-def execute_buy(sym, amt):
+def execute_buy(sym, amt, price_hint=None):
+    if not LIVE_MODE:
+        price = price_hint
+        if price is None:
+            try:
+                ticker = exchange.fetch_ticker(sym)
+                price = float(ticker.get("last") or ticker.get("close") or 0.0)
+            except Exception:
+                price = None
+        return _paper_trade("paper_buy", sym, amt, price)
     if AGGRESSIVE_MODE:
         order = exchange.create_market_buy_order(sym, amt)
         print(Fore.GREEN + f"BUY {sym} {amt:.4f} (aggressive)")
@@ -912,7 +945,16 @@ def execute_buy(sym, amt):
         print(Fore.RED + f"BUY error {sym}: {e}")
         return None
 
-def execute_sell(sym, amt):
+def execute_sell(sym, amt, price_hint=None):
+    if not LIVE_MODE:
+        price = price_hint
+        if price is None:
+            try:
+                ticker = exchange.fetch_ticker(sym)
+                price = float(ticker.get("last") or ticker.get("close") or 0.0)
+            except Exception:
+                price = None
+        return _paper_trade("paper_sell", sym, amt, price)
     if AGGRESSIVE_MODE:
         order = exchange.create_market_sell_order(sym, amt)
         print(Fore.GREEN + f"SELL {sym} {amt:.4f} (aggressive)")
@@ -1328,8 +1370,7 @@ def run_momentum_engine():
                 if pending_trade:
                     sym, alloc, price_entry, prob_entry, threshold_entry, risk_mod_entry, expected_entry = pending_trade
                     amt = alloc / price_entry
-                    if LIVE_MODE:
-                        execute_buy(sym, amt)
+                    execute_buy(sym, amt, price_entry)
                     with momentum_holdings_lock:
                         if sym in momentum_holdings:
                             pass
@@ -1408,8 +1449,7 @@ def run_momentum_engine():
                     "hold_seconds": hold_duration,
                     "engine": "momentum"
                 })
-                if LIVE_MODE:
-                    execute_sell(sym, info.get("amount", 0.0))
+                execute_sell(sym, info.get("amount", 0.0), exit_price)
             render_status(tickers, interval, best_sym, best_prob, current_risk, best_threshold, btc_ctx)
             safe_sleep(interval)
         except ccxt.BaseError as e:
@@ -1480,8 +1520,7 @@ def run_dip_buy_engine():
                         if allocation < MIN_HOLD_VALUE:
                             continue
                         amount = allocation / price
-                        if LIVE_MODE:
-                            execute_buy(sym, amount)
+                        execute_buy(sym, amount, price)
                         if position is None:
                             position = {
                                 "layers": {},
@@ -1556,8 +1595,7 @@ def run_dip_buy_engine():
                     persist_dip_holdings()
             for sym, amount, avg_entry, price, position in exits:
                 pnl = (price - avg_entry) * amount
-                if LIVE_MODE:
-                    execute_sell(sym, amount)
+                execute_sell(sym, amount, price)
                 with state_lock:
                     state["realized_profit"] += pnl
                     today = datetime.now().strftime("%Y-%m-%d")
