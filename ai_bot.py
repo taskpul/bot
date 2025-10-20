@@ -11,7 +11,8 @@ Now includes:
 • Adaptive risk sizing and regime-aware probability thresholds
 """
 
-import os, time, json, warnings, pandas as pd, numpy as np, ccxt, requests, concurrent.futures
+import os, time, json, warnings, pandas as pd, numpy as np, ccxt, requests, concurrent.futures, threading
+from copy import deepcopy
 from dotenv import load_dotenv
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
@@ -53,6 +54,11 @@ RISK_STEP = 0.02
 RISK_LOOKBACK = 12
 BASE_CAPITAL = 1200.0
 STATE_FILE = "adaptive_dynamic_dashboard_state.json"
+MOMENTUM_CAPITAL_RATIO = 0.5
+DIPBUY_CAPITAL_RATIO = 0.5
+DIP_STATE_FILE = "dip_state.json"
+DIP_SYMBOLS = ["BTC/USDC", "ETH/USDC", "BNB/USDC"]
+DIP_INTERVAL = 60
 MODEL_DIR = "models"
 LIVE_MODE = env_bool("LIVE_MODE", False)
 DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", False)
@@ -274,9 +280,52 @@ def load_state():
     }
 
 def save_state(s):
-    json.dump(s, open(STATE_FILE, "w"), indent=2)
+    with state_lock:
+        json.dump(s, open(STATE_FILE, "w"), indent=2)
 
 state = load_state()
+state_lock = threading.RLock()
+
+
+def load_dip_state():
+    if os.path.exists(DIP_STATE_FILE):
+        try:
+            data = json.load(open(DIP_STATE_FILE))
+            data.setdefault("holdings", {})
+            data.setdefault("realized_profit", 0.0)
+            data.setdefault("daily_profit", 0.0)
+            data.setdefault("last_date", datetime.now().strftime("%Y-%m-%d"))
+            return data
+        except Exception:
+            pass
+    return {
+        "holdings": {},
+        "realized_profit": 0.0,
+        "daily_profit": 0.0,
+        "last_date": datetime.now().strftime("%Y-%m-%d")
+    }
+
+
+def save_dip_state(s):
+    with dip_state_lock:
+        with open(DIP_STATE_FILE, "w") as fh:
+            json.dump(s, fh, indent=2)
+
+
+dip_state = load_dip_state()
+dip_state_lock = threading.RLock()
+momentum_holdings_lock = threading.RLock()
+dip_holdings_lock = threading.RLock()
+dip_holdings = dip_state.setdefault("holdings", {})
+momentum_holdings = {}
+
+
+def persist_dip_holdings():
+    with dip_holdings_lock:
+        snapshot = deepcopy(dip_holdings)
+    with dip_state_lock:
+        dip_state["holdings"] = snapshot
+        save_dip_state(dip_state)
 
 
 def _normalize_holding_entry(sym, entry, default_source="bot"):
@@ -312,16 +361,20 @@ def persist_holdings(holdings):
         normalized = _normalize_holding_entry(sym, entry, entry.get("source", "bot") if isinstance(entry, dict) else "bot")
         if normalized:
             snapshot[sym] = normalized
-    if state.get("holdings_snapshot") != snapshot:
-        state["holdings_snapshot"] = snapshot
-        save_state(state)
+    with state_lock:
+        if state.get("holdings_snapshot") != snapshot:
+            state["holdings_snapshot"] = snapshot
+            save_state(state)
 
 def effective_capital():
-    return BASE_CAPITAL + state["realized_profit"]
+    with state_lock:
+        realized = state.get("realized_profit", 0.0)
+    return BASE_CAPITAL + realized
 
 
 def recent_trade_stats():
-    history = state.get("trade_history", [])
+    with state_lock:
+        history = list(state.get("trade_history", []))
     if not history:
         return {"win_rate": 0.5, "avg_pnl": 0.0}
     wins = sum(1 for p in history if p > 0)
@@ -332,42 +385,45 @@ def recent_trade_stats():
 
 def adjust_risk_from_history():
     stats = recent_trade_stats()
-    current = state.get("current_risk_percent", BASE_RISK_PERCENT)
-    new_risk = current
-    if stats["avg_pnl"] > 0 and stats["win_rate"] > 0.6:
-        new_risk = min(MAX_RISK_PERCENT, current + RISK_STEP)
-    elif stats["avg_pnl"] < 0 and stats["win_rate"] < 0.4:
-        new_risk = max(MIN_RISK_PERCENT, current - RISK_STEP)
-    else:
-        # mean-revert gently toward baseline when performance is mixed
-        if current > BASE_RISK_PERCENT:
-            new_risk = max(BASE_RISK_PERCENT, current - RISK_STEP / 2)
-        elif current < BASE_RISK_PERCENT:
-            new_risk = min(BASE_RISK_PERCENT, current + RISK_STEP / 2)
-    state["current_risk_percent"] = round(new_risk, 4)
-    save_state(state)
-    return state["current_risk_percent"]
+    with state_lock:
+        current = state.get("current_risk_percent", BASE_RISK_PERCENT)
+        new_risk = current
+        if stats["avg_pnl"] > 0 and stats["win_rate"] > 0.6:
+            new_risk = min(MAX_RISK_PERCENT, current + RISK_STEP)
+        elif stats["avg_pnl"] < 0 and stats["win_rate"] < 0.4:
+            new_risk = max(MIN_RISK_PERCENT, current - RISK_STEP)
+        else:
+            # mean-revert gently toward baseline when performance is mixed
+            if current > BASE_RISK_PERCENT:
+                new_risk = max(BASE_RISK_PERCENT, current - RISK_STEP / 2)
+            elif current < BASE_RISK_PERCENT:
+                new_risk = min(BASE_RISK_PERCENT, current + RISK_STEP / 2)
+        state["current_risk_percent"] = round(new_risk, 4)
+        save_state(state)
+        return state["current_risk_percent"]
 
 
 def record_trade_pnl(pnl):
-    history = state.setdefault("trade_history", [])
-    history.append(float(pnl))
-    if len(history) > RISK_LOOKBACK:
-        del history[0:len(history) - RISK_LOOKBACK]
-    adjust_risk_from_history()
-    save_state(state)
+    with state_lock:
+        history = state.setdefault("trade_history", [])
+        history.append(float(pnl))
+        if len(history) > RISK_LOOKBACK:
+            del history[0:len(history) - RISK_LOOKBACK]
+        adjust_risk_from_history()
+        save_state(state)
 
 
 def record_expected_vs_realized(expected, realized):
-    history = state.setdefault("expected_realized_history", [])
-    history.append({"expected": float(expected), "realized": float(realized)})
-    if len(history) > 100:
-        del history[0:len(history) - 100]
-    bias = state.get("threshold_bias", 0.0)
-    diff = realized - expected
-    bias_adjust = np.clip(-diff * 0.02, -0.02, 0.02)
-    state["threshold_bias"] = float(np.clip(bias + bias_adjust, -0.08, 0.08))
-    save_state(state)
+    with state_lock:
+        history = state.setdefault("expected_realized_history", [])
+        history.append({"expected": float(expected), "realized": float(realized)})
+        if len(history) > 100:
+            del history[0:len(history) - 100]
+        bias = state.get("threshold_bias", 0.0)
+        diff = realized - expected
+        bias_adjust = np.clip(-diff * 0.02, -0.02, 0.02)
+        state["threshold_bias"] = float(np.clip(bias + bias_adjust, -0.08, 0.08))
+        save_state(state)
 
 
 def volatility_risk_modifier(btc_ctx):
@@ -451,6 +507,54 @@ def max_correlation_with_holdings(symbol, candidate_df, holdings, data_dict):
             continue
         max_corr = max(max_corr, abs(float(corr)))
     return max_corr
+
+
+def momentum_used_capital(holdings):
+    total = 0.0
+    for info in holdings.values():
+        try:
+            amount = float(info.get("amount", 0.0) or 0.0)
+            price = float(info.get("entry_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        total += max(amount * price, 0.0)
+    return total
+
+
+def dip_used_capital(dip_holdings):
+    total = 0.0
+    for info in dip_holdings.values():
+        layers = info.get("layers", {}) if isinstance(info, dict) else {}
+        for layer in layers.values():
+            try:
+                total += float(layer.get("allocation", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def total_engine_exposure(momentum_holdings, dip_holdings):
+    return momentum_used_capital(momentum_holdings) + dip_used_capital(dip_holdings)
+
+
+def available_capital_for_engine(momentum_holdings, dip_holdings, engine):
+    total_cap = effective_capital() * MAX_CAPITAL_EXPOSURE
+    momentum_used = momentum_used_capital(momentum_holdings)
+    dip_used = dip_used_capital(dip_holdings)
+    combined_used = momentum_used + dip_used
+    remaining_total = max(total_cap - combined_used, 0.0)
+    if engine == "momentum":
+        engine_budget = total_cap * MOMENTUM_CAPITAL_RATIO
+        engine_used = momentum_used
+    else:
+        engine_budget = total_cap * DIPBUY_CAPITAL_RATIO
+        engine_used = dip_used
+    remaining_engine = max(engine_budget - engine_used, 0.0)
+    return max(min(remaining_engine, remaining_total), 0.0)
+
+
+def snapshot_holdings(src_holdings):
+    return deepcopy(src_holdings)
 
 # ───────────────────────── MODEL ───────────────────────────
 class SymbolModel:
@@ -966,7 +1070,7 @@ def sync_holdings_with_exchange(holdings):
             holdings.pop(sym, None)
     persist_holdings(holdings)
 
-def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
+def print_dashboard(tickers, momentum_snapshot, dip_snapshot, state, dip_state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
     clear_console()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(Fore.MAGENTA + Style.BRIGHT + "══════════ ADAPTIVE ATR MOMENTUM BOT v3.6 DASHBOARD ══════════")
@@ -974,14 +1078,16 @@ def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, cur
     print(Fore.CYAN + f"Next Run In: {interval}s")
     print(Fore.WHITE + "-"*65)
     total_cap = effective_capital()
-    used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
+    momentum_used = momentum_used_capital(momentum_snapshot)
+    dip_used = dip_used_capital(dip_snapshot)
+    used_cap = momentum_used + dip_used
     free_cap = total_cap - used_cap
     profit_color = Fore.GREEN if state["daily_profit"] >= 0 else Fore.RED
     print(Fore.GREEN + f"Total Capital: ${total_cap:,.2f}")
-    print(Fore.YELLOW + f"Used Capital:  ${used_cap:,.2f}")
+    print(Fore.YELLOW + f"Used Capital:  ${used_cap:,.2f} (Momentum ${momentum_used:,.2f} | Dip ${dip_used:,.2f})")
     print(Fore.WHITE + f"Free Capital:  ${free_cap:,.2f}")
     stats = recent_trade_stats()
-    print(Fore.WHITE + f"Dynamic Risk:  {current_risk*100:.1f}% (win {stats['win_rate']*100:.0f}% avgPnL {stats['avg_pnl']:+.2f})")
+    print(Fore.WHITE + f"Dynamic Risk:  {current_risk*100:.1f}% (win {stats['win_rate']*100:.0f}% avgPnL {stats['avg_pnl']:+.2f}")
     bias = state.get("threshold_bias", 0.0)
     port_mod = state.get("last_portfolio_modifier", 1.0)
     print(Fore.WHITE + f"Entry Threshold: {threshold:.2f} (bias {bias:+.3f})  BTC vol {btc_ctx.get('volatility',0):.3f} trend {btc_ctx.get('trend_strength',0):+.3f}  PortMod {port_mod:.2f}")
@@ -991,16 +1097,35 @@ def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, cur
     print(profit_color + f"Today's P/L:   {state['daily_profit']:+.2f} USDC")
     print(Fore.WHITE + "-"*65)
     print(Fore.CYAN + Style.BRIGHT + "CURRENT HOLDINGS")
-    if not holdings:
+    if not momentum_snapshot:
         print(Fore.LIGHTBLACK_EX + "  None")
     else:
-        for sym, h in holdings.items():
+        for sym, h in momentum_snapshot.items():
             if sym in tickers:
                 price = tickers[sym]["last"]
-                pnl = (price - h["entry_price"]) * h["amount"]
-                color = Fore.GREEN if pnl >= 0 else Fore.RED
-                trail_high = h.get("trail_high", h["entry_price"])
-                print(color + f"  {sym:<10} Price: {price:.4f}  PnL: {pnl:+.2f}  SL: {h['stop_loss']:.4f}  TH: {trail_high:.4f}")
+            else:
+                price = h.get("entry_price", 0.0)
+            pnl = (price - h["entry_price"]) * h["amount"]
+            color = Fore.GREEN if pnl >= 0 else Fore.RED
+            trail_high = h.get("trail_high", h["entry_price"])
+            print(color + f"  {sym:<10} Price: {price:.4f}  PnL: {pnl:+.2f}  SL: {h['stop_loss']:.4f}  TH: {trail_high:.4f}")
+    print(Fore.WHITE + "-"*65)
+    print(Fore.CYAN + Style.BRIGHT + "DIP-BUY HOLDINGS")
+    if not dip_snapshot:
+        print(Fore.LIGHTBLACK_EX + "  None")
+    else:
+        for sym, info in dip_snapshot.items():
+            if sym in tickers:
+                price = tickers[sym]["last"]
+            else:
+                price = info.get("avg_entry", 0.0)
+            avg_entry = info.get("avg_entry", 0.0)
+            amount = info.get("total_amount", 0.0)
+            pnl = (price - avg_entry) * amount
+            color = Fore.GREEN if pnl >= 0 else Fore.RED
+            trail_stop = info.get("trail_stop")
+            layers = ", ".join(sorted(info.get("layers", {}).keys())) or "-"
+            print(color + f"  {sym:<10} Price: {price:.4f}  Avg: {avg_entry:.4f}  Amt: {amount:.6f}  PnL: {pnl:+.2f}  Trail: {trail_stop if trail_stop else 0:.4f}  Layers: {layers}")
     print(Fore.WHITE + "-"*65)
     if next_sym:
         print(Fore.BLUE + Style.BRIGHT + f"Next Target Symbol: {next_sym}  (Prob: {next_prob:.2f})")
@@ -1010,17 +1135,19 @@ def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, cur
     print(Fore.LIGHTBLACK_EX + "Press CTRL+C to exit.\n")
 
 
-def print_debug_status(tickers, holdings, state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
+
+def print_debug_status(tickers, momentum_snapshot, dip_snapshot, state, dip_state, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_cap = effective_capital()
-    used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
-    free_cap = total_cap - used_cap
+    momentum_used = momentum_used_capital(momentum_snapshot)
+    dip_used = dip_used_capital(dip_snapshot)
+    free_cap = total_cap - (momentum_used + dip_used)
     stats = recent_trade_stats()
     bias = state.get("threshold_bias", 0.0)
     port_mod = state.get("last_portfolio_modifier", 1.0)
     summary = (
-        f"[{now}] Next run in {interval}s | Holdings: {len(holdings)} | Free cap: ${free_cap:,.2f} | "
-        f"Risk: {current_risk*100:.1f}% (win {stats['win_rate']*100:.0f}% avgPnL {stats['avg_pnl']:+.2f}) | "
+        f"[{now}] Next run in {interval}s | Holdings: {len(momentum_snapshot)} | Dip positions: {len(dip_snapshot)} | "
+        f"Free cap: ${free_cap:,.2f} | Risk: {current_risk*100:.1f}% (win {stats['win_rate']*100:.0f}% avgPnL {stats['avg_pnl']:+.2f}) | "
         f"Threshold: {threshold:.2f} (bias {bias:+.3f}) | BTC vol {btc_ctx.get('volatility',0):.3f} trend {btc_ctx.get('trend_strength',0):+.3f} | PortMod {port_mod:.2f}"
     )
     print(Fore.CYAN + summary)
@@ -1028,9 +1155,9 @@ def print_debug_status(tickers, holdings, state, interval, next_sym, next_prob, 
         print(Fore.BLUE + f"  Next target: {next_sym} (prob {next_prob:.2f})")
     else:
         print(Fore.LIGHTBLACK_EX + "  No qualifying entry signal yet.")
-    if holdings:
-        print(Fore.CYAN + "  Holdings snapshot:")
-        for sym, h in holdings.items():
+    if momentum_snapshot:
+        print(Fore.CYAN + "  Momentum holdings:")
+        for sym, h in momentum_snapshot.items():
             if sym not in tickers:
                 continue
             price = tickers[sym]["last"]
@@ -1038,207 +1165,450 @@ def print_debug_status(tickers, holdings, state, interval, next_sym, next_prob, 
             color = Fore.GREEN if pnl >= 0 else Fore.RED
             trail_high = h.get("trail_high", h["entry_price"])
             print(color + f"    {sym:<10} price {price:.4f} pnl {pnl:+.2f} sl {h['stop_loss']:.4f} th {trail_high:.4f}")
+    if dip_snapshot:
+        print(Fore.CYAN + "  Dip-buy holdings:")
+        for sym, info in dip_snapshot.items():
+            price = tickers.get(sym, {}).get('last', info.get('avg_entry', 0.0))
+            avg_entry = info.get('avg_entry', 0.0)
+            amount = info.get('total_amount', 0.0)
+            pnl = (price - avg_entry) * amount
+            color = Fore.GREEN if pnl >= 0 else Fore.RED
+            layers = ', '.join(sorted(info.get('layers', {}).keys())) or '-'
+            print(color + f"    {sym:<10} price {price:.4f} pnl {pnl:+.2f} avg {avg_entry:.4f} amt {amount:.6f} layers {layers}")
     print(Fore.WHITE + "-"*65)
 
 
-def render_status(*args, **kwargs):
+
+def render_status(tickers, interval, next_sym, next_prob, current_risk, threshold, btc_ctx):
+    with momentum_holdings_lock:
+        momentum_snapshot = snapshot_holdings(momentum_holdings)
+    with dip_holdings_lock:
+        dip_snapshot = snapshot_holdings(dip_holdings)
+    with state_lock:
+        state_snapshot = deepcopy(state)
+    with dip_state_lock:
+        dip_state_snapshot = deepcopy(dip_state)
     if DEBUG_MODE:
-        print_debug_status(*args, **kwargs)
+        print_debug_status(tickers, momentum_snapshot, dip_snapshot, state_snapshot, dip_state_snapshot, interval, next_sym, next_prob, current_risk, threshold, btc_ctx)
     else:
-        print_dashboard(*args, **kwargs)
+        print_dashboard(tickers, momentum_snapshot, dip_snapshot, state_snapshot, dip_state_snapshot, interval, next_sym, next_prob, current_risk, threshold, btc_ctx)
 
-# ───────────────────────── MAIN LOOP ───────────────────────
-symbols = discover_symbols()
-models = {s: SymbolModel(s) for s in symbols}
-holdings = load_existing_holdings()
-print(Fore.MAGENTA + "Starting Adaptive ATR Momentum Bot v3.6 (USDC only)")
-if DEBUG_MODE:
-    print(Fore.YELLOW + "DEBUG_MODE enabled: streaming loop logs instead of dashboard UI.")
-else:
-    print(Fore.YELLOW + "Dashboard mode active. Set DEBUG_MODE=1 to view streaming logs.")
-
-last_heartbeat = 0.0
-while True:
-    try:
-        now = time.time()
-        if now - last_heartbeat >= 3600:
-            notify("✅ AI Momentum Bot is alive and working normally.")
-            last_heartbeat = now
-        sync_holdings_with_exchange(holdings)
-        btc_ctx = fetch_btc_context()
-        if not DISABLE_BTC_FILTER:
-            if (not btc_ctx["bullish"]) and btc_ctx["trend_strength"] < -0.01:
-                print(Fore.LIGHTBLACK_EX + "BTC downtrend — blocking entries.")
-                safe_sleep(interval)
-                continue
-
-        symbols = discover_symbols()
-        for s in symbols:
-            models.setdefault(s, SymbolModel(s))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as ex:
-            data = list(ex.map(lambda s: (s, fetch_symbol_ohlcv(s, slow_ema + 120)), symbols))
-        tickers = safe_fetch_tickers()
-        data_dict = {sym: df for sym, df in data}
-        for held_sym in holdings.keys():
-            if held_sym not in data_dict:
-                data_dict[held_sym] = fetch_symbol_ohlcv(held_sym, slow_ema + 120)
-
-        entry_threshold = 0.52 if AGGRESSIVE_MODE else dynamic_entry_threshold(btc_ctx)
-        current_risk = state.get("current_risk_percent", BASE_RISK_PERCENT)
-        portfolio_mod = portfolio_risk_adjustment(holdings, data_dict)
-        state["last_portfolio_modifier"] = portfolio_mod
-
-        best_sym, best_score, best_prob, best_price = None, -np.inf, 0, 0
-        best_threshold, best_risk_mod, best_expected = entry_threshold, 1.0, 0.0
-        for sym, df in data:
-            if df.empty:
-                log_decision(sym, {"reason": "no_data"})
-                continue
-            m = models[sym]
-            if time.time() - m.last_train > 3600:
-                m.update(df)
-            if not candle_is_fresh(df):
-                log_decision(sym, {"reason": "stale_candle"})
-                continue
-            prepared = m.prepare_df(df)
-            p = m.predict(prepared)
-            price, atr = prepared["close"].iloc[-1], prepared["atr"].iloc[-1]
-            sym_threshold = m.adjusted_threshold(entry_threshold)
-            risk_mod = m.risk_modifier()
-            expected_forward = m.performance.get("expected_forward_return", m.performance.get("avg_forward_return", 0.0))
-            execution_cost = m.performance.get("execution_cost", FEE_RATE * 2 + SLIPPAGE_RATE)
-            net_expected = expected_forward - execution_cost
-            corr = max_correlation_with_holdings(sym, df, holdings, data_dict)
-            walk_precision = m.performance.get("walk_forward_precision", 0.0)
-            decision_context = {
-                "probability": round(float(p), 4),
-                "threshold": round(float(sym_threshold), 4),
-                "expected_forward": round(float(expected_forward), 6),
-                "net_expected": round(float(net_expected), 6),
-                "execution_cost": round(float(execution_cost), 6),
-                "walk_precision": round(float(walk_precision), 4),
-                "correlation": round(float(corr), 4)
-            }
-            if not AGGRESSIVE_MODE:
-                if net_expected <= 0:
-                    decision_context["status"] = "skip_low_expectation"
-                    log_decision(sym, decision_context)
+# ───────────────────────── ENGINE RUNNERS ───────────────────────
+def run_momentum_engine():
+    global momentum_holdings
+    symbols = discover_symbols()
+    models = {s: SymbolModel(s) for s in symbols}
+    with momentum_holdings_lock:
+        if not momentum_holdings:
+            momentum_holdings.update(load_existing_holdings())
+    print(Fore.MAGENTA + "Starting Adaptive ATR Momentum Engine")
+    if DEBUG_MODE:
+        print(Fore.YELLOW + "[MOMENTUM] DEBUG_MODE enabled: streaming loop logs instead of dashboard UI.")
+    else:
+        print(Fore.YELLOW + "[MOMENTUM] Dashboard mode active. Set DEBUG_MODE=1 to view streaming logs.")
+    last_heartbeat = 0.0
+    while True:
+        try:
+            now = time.time()
+            if now - last_heartbeat >= 3600:
+                notify("✅ AI Momentum Bot is alive and working normally.")
+                last_heartbeat = now
+            with momentum_holdings_lock:
+                sync_holdings_with_exchange(momentum_holdings)
+                holdings_snapshot = snapshot_holdings(momentum_holdings)
+            with dip_holdings_lock:
+                dip_snapshot = snapshot_holdings(dip_holdings)
+            btc_ctx = fetch_btc_context()
+            if not DISABLE_BTC_FILTER:
+                if (not btc_ctx["bullish"]) and btc_ctx["trend_strength"] < -0.01:
+                    print(Fore.LIGHTBLACK_EX + "[MOMENTUM] BTC downtrend — blocking entries.")
+                    safe_sleep(interval)
                     continue
-                if walk_precision < 0.45:
-                    decision_context["status"] = "skip_validation"
-                    log_decision(sym, decision_context)
+            symbols = discover_symbols()
+            for s in symbols:
+                models.setdefault(s, SymbolModel(s))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as ex:
+                data = list(ex.map(lambda sym: (sym, fetch_symbol_ohlcv(sym, slow_ema + 120)), symbols))
+            tickers = safe_fetch_tickers()
+            data_dict = {sym: df for sym, df in data}
+            for held_sym in holdings_snapshot.keys():
+                if held_sym not in data_dict:
+                    data_dict[held_sym] = fetch_symbol_ohlcv(held_sym, slow_ema + 120)
+            entry_threshold = 0.52 if AGGRESSIVE_MODE else dynamic_entry_threshold(btc_ctx)
+            with state_lock:
+                current_risk = state.get("current_risk_percent", BASE_RISK_PERCENT)
+            portfolio_mod = portfolio_risk_adjustment(holdings_snapshot, data_dict)
+            with state_lock:
+                state["last_portfolio_modifier"] = portfolio_mod
+                save_state(state)
+            best_sym, best_score, best_prob, best_price = None, -np.inf, 0.0, 0.0
+            best_threshold, best_risk_mod, best_expected = entry_threshold, 1.0, 0.0
+            for sym, df in data:
+                if df.empty:
+                    log_decision(sym, {"reason": "no_data"})
                     continue
-                if corr >= MAX_SYMBOL_CORRELATION:
-                    decision_context["status"] = "skip_correlation"
-                    log_decision(sym, decision_context)
+                m = models[sym]
+                if time.time() - m.last_train > 3600:
+                    m.update(df)
+                if not candle_is_fresh(df):
+                    log_decision(sym, {"reason": "stale_candle"})
                     continue
-            decision_context["status"] = "candidate"
-            log_decision(sym, decision_context)
-            score = float(p) if AGGRESSIVE_MODE else float(p * max(net_expected, 1e-6))
-            if score > best_score:
-                best_sym, best_score = sym, score
-                best_prob, best_price = p, price
-                best_threshold = 0.52 if AGGRESSIVE_MODE else sym_threshold
-                best_risk_mod, best_expected = risk_mod, net_expected
-
-        if best_sym and best_sym not in holdings and (AGGRESSIVE_MODE or best_prob > best_threshold):
-            if len(holdings) >= MAX_OPEN_POSITIONS:
-                log_decision(best_sym, {"reason": "max_positions_reached", "open_positions": len(holdings)})
-            else:
-                corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
-                if AGGRESSIVE_MODE or corr < MAX_SYMBOL_CORRELATION:
-                    used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
-                    remaining_cap = max(effective_capital() * MAX_CAPITAL_EXPOSURE - used_cap, 0)
-                    if remaining_cap <= 0:
-                        log_decision(best_sym, {"reason": "no_remaining_cap", "used_cap": used_cap})
+                prepared = m.prepare_df(df)
+                p = m.predict(prepared)
+                price, atr = prepared["close"].iloc[-1], prepared["atr"].iloc[-1]
+                sym_threshold = m.adjusted_threshold(entry_threshold)
+                risk_mod = m.risk_modifier()
+                expected_forward = m.performance.get("expected_forward_return", m.performance.get("avg_forward_return", 0.0))
+                execution_cost = m.performance.get("execution_cost", FEE_RATE * 2 + SLIPPAGE_RATE)
+                net_expected = expected_forward - execution_cost
+                corr = max_correlation_with_holdings(sym, df, holdings_snapshot, data_dict)
+                walk_precision = m.performance.get("walk_forward_precision", 0.0)
+                decision_context = {
+                    "probability": round(float(p), 4),
+                    "threshold": round(float(sym_threshold), 4),
+                    "expected_forward": round(float(expected_forward), 6),
+                    "net_expected": round(float(net_expected), 6),
+                    "execution_cost": round(float(execution_cost), 6),
+                    "walk_precision": round(float(walk_precision), 4),
+                    "correlation": round(float(corr), 4)
+                }
+                if not AGGRESSIVE_MODE:
+                    if net_expected <= 0:
+                        decision_context["status"] = "skip_low_expectation"
+                        log_decision(sym, decision_context)
+                        continue
+                    if walk_precision < 0.45:
+                        decision_context["status"] = "skip_validation"
+                        log_decision(sym, decision_context)
+                        continue
+                    if corr >= MAX_SYMBOL_CORRELATION:
+                        decision_context["status"] = "skip_correlation"
+                        log_decision(sym, decision_context)
+                        continue
+                decision_context["status"] = "candidate"
+                log_decision(sym, decision_context)
+                score = float(p) if AGGRESSIVE_MODE else float(p * max(net_expected, 1e-6))
+                if score > best_score:
+                    best_sym, best_score = sym, score
+                    best_prob, best_price = p, price
+                    best_threshold = 0.52 if AGGRESSIVE_MODE else sym_threshold
+                    best_risk_mod, best_expected = risk_mod, net_expected
+            trade_executed = False
+            pending_trade = None
+            if best_sym and (AGGRESSIVE_MODE or best_prob > best_threshold):
+                with momentum_holdings_lock:
+                    if best_sym in momentum_holdings:
+                        pass
+                    elif len(momentum_holdings) >= MAX_OPEN_POSITIONS:
+                        log_decision(best_sym, {"reason": "max_positions_reached", "open_positions": len(momentum_holdings)})
                     else:
-                        per_trade_capital = effective_capital() / MAX_OPEN_POSITIONS
-                        alloc = min(per_trade_capital, remaining_cap)
-                        if alloc < MIN_HOLD_VALUE:
-                            log_decision(best_sym, {"reason": "allocation_below_min", "allocation": alloc})
-                        elif alloc > 0:
-                            amt = alloc / best_price
-                            if LIVE_MODE:
-                                execute_buy(best_sym, amt)
-                            expected_pnl = alloc * best_expected
-                            holdings[best_sym] = {
+                        with dip_holdings_lock:
+                            engine_available = available_capital_for_engine(momentum_holdings, dip_holdings, "momentum")
+                        if engine_available <= 0:
+                            log_decision(best_sym, {"reason": "no_remaining_cap", "available_cap": engine_available})
+                        else:
+                            corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), momentum_holdings, data_dict)
+                            if not AGGRESSIVE_MODE and corr >= MAX_SYMBOL_CORRELATION:
+                                log_decision(best_sym, {"reason": "blocked_correlation", "correlation": corr})
+                            else:
+                                per_trade_cap = (effective_capital() * MOMENTUM_CAPITAL_RATIO) / max(MAX_OPEN_POSITIONS, 1)
+                                alloc = min(per_trade_cap, engine_available)
+                                if alloc < MIN_HOLD_VALUE:
+                                    log_decision(best_sym, {"reason": "allocation_below_min", "allocation": alloc})
+                                elif alloc > 0:
+                                    pending_trade = (
+                                        best_sym,
+                                        alloc,
+                                        best_price,
+                                        best_prob,
+                                        best_threshold,
+                                        best_risk_mod,
+                                        best_expected,
+                                    )
+                if pending_trade:
+                    sym, alloc, price_entry, prob_entry, threshold_entry, risk_mod_entry, expected_entry = pending_trade
+                    amt = alloc / price_entry
+                    if LIVE_MODE:
+                        execute_buy(sym, amt)
+                    with momentum_holdings_lock:
+                        if sym in momentum_holdings:
+                            pass
+                        else:
+                            momentum_holdings[sym] = {
                                 "amount": amt,
-                                "entry_price": best_price,
-                                "expected_return": best_expected,
-                                "expected_prob": best_prob,
-                                "expected_pnl": expected_pnl,
+                                "entry_price": price_entry,
+                                "expected_return": expected_entry,
+                                "expected_prob": prob_entry,
+                                "expected_pnl": alloc * expected_entry,
                                 "entry_time": datetime.now(timezone.utc).isoformat(),
                                 "source": "bot",
                             }
-                            apply_uniform_risk_controls(holdings[best_sym], best_price)
-                            log_trade("entry", best_sym, {
-                                "amount": amt,
-                                "price": best_price,
-                                "prob": best_prob,
-                                "expected_return": best_expected,
-                                "expected_pnl": expected_pnl,
-                                "allocation": alloc,
-                                "threshold": best_threshold,
-                                "risk_mod": best_risk_mod,
-                                "portfolio_mod": portfolio_mod
-                            })
-                            persist_holdings(holdings)
-                else:
-                    log_decision(best_sym, {"reason": "blocked_correlation", "correlation": corr})
-        # Exit Management
-        for sym, h in list(holdings.items()):
-            if sym not in tickers:
-                continue
-            price = tickers[sym]["last"]
-            entry_price = h["entry_price"]
-            apply_uniform_risk_controls(h, price)
-            pnl = (price - entry_price) * h["amount"]
-
-            if price <= h["stop_loss"]:
-                pnl = (price - entry_price) * h["amount"]
-                state["realized_profit"] += pnl
-                today = datetime.now().strftime("%Y-%m-%d")
-                if today != state.get("last_date"):
-                    state["last_date"] = today
-                    state["daily_profit"] = 0.0
-                state["daily_profit"] += pnl
+                            apply_uniform_risk_controls(momentum_holdings[sym], price_entry)
+                            persist_holdings(momentum_holdings)
+                            trade_executed = True
+                if trade_executed:
+                    log_trade("entry", sym, {
+                        "amount": amt,
+                        "price": price_entry,
+                        "prob": prob_entry,
+                        "expected_return": expected_entry,
+                        "expected_pnl": alloc * expected_entry,
+                        "allocation": alloc,
+                        "threshold": threshold_entry,
+                        "risk_mod": risk_mod_entry,
+                        "portfolio_mod": portfolio_mod,
+                        "engine": "momentum",
+                    })
+                    notify(f"[MOMENTUM] Entry {sym} prob {prob_entry:.3f}")
+                    print(Fore.GREEN + f"[MOMENTUM] ENTRY {sym} alloc ${alloc:.2f} price {price_entry:.4f}")
+            exits = []
+            with momentum_holdings_lock:
+                for sym, h in list(momentum_holdings.items()):
+                    if sym not in tickers:
+                        continue
+                    price = tickers[sym]["last"]
+                    apply_uniform_risk_controls(h, price)
+                    entry_price = h["entry_price"]
+                    if price <= h.get("stop_loss", entry_price * 0.98):
+                        pnl = (price - entry_price) * h["amount"]
+                        exits.append((sym, h.copy(), price, pnl))
+                        del momentum_holdings[sym]
+                if exits or trade_executed:
+                    persist_holdings(momentum_holdings)
+            for sym, info, exit_price, pnl in exits:
+                with state_lock:
+                    state["realized_profit"] += pnl
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    if today != state.get("last_date"):
+                        state["last_date"] = today
+                        state["daily_profit"] = 0.0
+                    state["daily_profit"] += pnl
+                    save_state(state)
                 record_trade_pnl(pnl)
-                expected_pnl = h.get("expected_pnl", 0.0)
+                expected_pnl = info.get("expected_pnl", 0.0)
                 record_expected_vs_realized(expected_pnl, pnl)
-                exit_reason = "stop_loss"
                 hold_duration = None
-                if h.get("entry_time"):
+                if info.get("entry_time"):
                     try:
-                        entry_dt = datetime.fromisoformat(h["entry_time"])
+                        entry_dt = datetime.fromisoformat(info["entry_time"])
                         if entry_dt.tzinfo is None:
                             entry_dt = entry_dt.replace(tzinfo=timezone.utc)
                         hold_duration = (datetime.now(timezone.utc) - entry_dt).total_seconds()
                     except Exception:
                         hold_duration = None
-                c = Fore.GREEN if pnl >= 0 else Fore.RED
-                print(c + f"EXIT {sym} PnL ${pnl:.2f} Total ${state['realized_profit']:.2f}")
-                notify(f"EXIT {sym} PnL ${pnl:.2f}")
+                color = Fore.GREEN if pnl >= 0 else Fore.RED
+                print(color + f"[MOMENTUM] EXIT {sym} PnL ${pnl:.2f} Total ${state.get('realized_profit', 0.0):.2f}")
+                notify(f"[MOMENTUM] Exit {sym} PnL ${pnl:.2f}")
                 log_trade("exit", sym, {
-                    "amount": h["amount"],
-                    "exit_price": price,
+                    "amount": info.get("amount", 0.0),
+                    "exit_price": exit_price,
                     "pnl": pnl,
                     "expected_pnl": expected_pnl,
-                    "exit_reason": exit_reason,
-                    "hold_seconds": hold_duration
+                    "exit_reason": "stop_loss",
+                    "hold_seconds": hold_duration,
+                    "engine": "momentum"
                 })
                 if LIVE_MODE:
-                    execute_sell(sym, h["amount"])
-                del holdings[sym]
-                persist_holdings(holdings)
+                    execute_sell(sym, info.get("amount", 0.0))
+            render_status(tickers, interval, best_sym, best_prob, current_risk, best_threshold, btc_ctx)
+            safe_sleep(interval)
+        except ccxt.BaseError as e:
+            print(Fore.RED + f"[MOMENTUM] Exchange error: {e}")
+            safe_sleep(60)
+        except Exception as e:
+            print(Fore.RED + f"[MOMENTUM] Runtime error: {e}")
+            safe_sleep(60)
 
-        persist_holdings(holdings)
-        render_status(tickers, holdings, state, interval, best_sym, best_prob, current_risk, best_threshold, btc_ctx)
-        safe_sleep(interval)
 
-    except ccxt.BaseError as e:
-        print(Fore.RED + f"Exchange error: {e}")
-        safe_sleep(60)
-    except Exception as e:
-        print(Fore.RED + f"Runtime error: {e}")
-        safe_sleep(60)
+# Dip-buy engine
+def run_dip_buy_engine():
+    print(Fore.MAGENTA + "Starting Volatility-Adaptive Dip-Buy Engine")
+    while True:
+        try:
+            with momentum_holdings_lock:
+                momentum_snapshot = snapshot_holdings(momentum_holdings)
+            with dip_holdings_lock:
+                dip_snapshot = snapshot_holdings(dip_holdings)
+            dip_budget_remaining = available_capital_for_engine(momentum_snapshot, dip_snapshot, "dip_buy")
+            if dip_budget_remaining <= 0:
+                safe_sleep(DIP_INTERVAL)
+                continue
+            market_info = {}
+            for sym in DIP_SYMBOLS:
+                df = fetch_symbol_ohlcv(sym, max(60, slow_ema))
+                if df.empty:
+                    continue
+                if not candle_is_fresh(df):
+                    continue
+                df["atr"] = calc_atr(df, atr_period)
+                recent_high = float(df["high"].iloc[-30:].max())
+                price = float(df["close"].iloc[-1])
+                atr_value = float(df["atr"].iloc[-1])
+                if price <= 0 or recent_high <= 0 or atr_value <= 0:
+                    continue
+                atr_pct = max((atr_value / price) * 100, 0.3)
+                market_info[sym] = {
+                    "price": price,
+                    "recent_high": recent_high,
+                    "atr_pct": atr_pct,
+                    "levels": [
+                        ("L1", atr_pct, 0.10),
+                        ("L2", atr_pct * 3, 0.20),
+                        ("L3", atr_pct * 6, 0.40),
+                    ]
+                }
+            total_budget = effective_capital() * MAX_CAPITAL_EXPOSURE * DIPBUY_CAPITAL_RATIO
+            # Entry management
+            for sym, info in market_info.items():
+                price = info["price"]
+                recent_high = info["recent_high"]
+                if recent_high <= 0:
+                    continue
+                drop_pct = ((recent_high - price) / recent_high) * 100
+                for layer_key, level_pct, layer_ratio in info["levels"]:
+                    if dip_budget_remaining <= 0:
+                        break
+                    trigger_price = recent_high * (1 - level_pct / 100)
+                    if price > trigger_price:
+                        continue
+                    with dip_holdings_lock:
+                        position = dip_holdings.get(sym)
+                        if position and layer_key in position.get("layers", {}):
+                            continue
+                        available_cap = available_capital_for_engine(momentum_snapshot, dip_holdings, "dip_buy")
+                        allocation = min(total_budget * layer_ratio, available_cap, dip_budget_remaining)
+                        if allocation < MIN_HOLD_VALUE:
+                            continue
+                        amount = allocation / price
+                        if LIVE_MODE:
+                            execute_buy(sym, amount)
+                        if position is None:
+                            position = {
+                                "layers": {},
+                                "total_amount": 0.0,
+                                "avg_entry": 0.0,
+                                "trail_active": False,
+                                "trail_stop": None,
+                                "trail_high": price,
+                                "entry_time": datetime.now(timezone.utc).isoformat(),
+                                "source": "dip_buy",
+                            }
+                        position.setdefault("layers", {})[layer_key] = {
+                            "allocation": allocation,
+                            "amount": amount,
+                            "entry_price": price,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                        total_amount = sum(layer.get("amount", 0.0) for layer in position["layers"].values())
+                        total_cost = sum(layer.get("amount", 0.0) * layer.get("entry_price", 0.0) for layer in position["layers"].values())
+                        position["total_amount"] = total_amount
+                        position["avg_entry"] = total_cost / max(total_amount, 1e-9)
+                        position["amount"] = total_amount
+                        position["entry_price"] = position["avg_entry"]
+                        position["trail_high"] = max(position.get("trail_high", price), price)
+                        apply_uniform_risk_controls(position, price)
+                        dip_holdings[sym] = position
+                        persist_dip_holdings()
+                        dip_budget_remaining = max(dip_budget_remaining - allocation, 0.0)
+                        log_trade("entry", sym, {
+                            "engine": "dip_buy",
+                            "layer": layer_key,
+                            "allocation": allocation,
+                            "amount": amount,
+                            "price": price,
+                            "drop_pct": drop_pct,
+                            "atr_pct": info["atr_pct"],
+                        })
+                        notify(f"[DIP] {sym} layer {layer_key} buy {amount:.6f} @ {price:.4f}")
+                        print(Fore.GREEN + f"[DIP] LAYER {layer_key} BUY {sym} alloc ${allocation:.2f} price {price:.4f}")
+            exits = []
+            with dip_holdings_lock:
+                for sym, position in list(dip_holdings.items()):
+                    market = market_info.get(sym)
+                    if not market:
+                        continue
+                    price = market["price"]
+                    if price <= 0:
+                        continue
+                    total_amount = sum(layer.get("amount", 0.0) for layer in position.get("layers", {}).values())
+                    if total_amount <= 0:
+                        dip_holdings.pop(sym, None)
+                        continue
+                    total_cost = sum(layer.get("amount", 0.0) * layer.get("entry_price", 0.0) for layer in position.get("layers", {}).values())
+                    avg_entry = total_cost / max(total_amount, 1e-9)
+                    position["total_amount"] = total_amount
+                    position["avg_entry"] = avg_entry
+                    position["amount"] = total_amount
+                    position["entry_price"] = avg_entry
+                    apply_uniform_risk_controls(position, price)
+                    if price >= avg_entry * 1.01 and not position.get("trail_active"):
+                        position["trail_active"] = True
+                        position["trail_high"] = price
+                        position["trail_stop"] = price * 0.992
+                        print(Fore.YELLOW + f"[DIP] Trail activated {sym} avg {avg_entry:.4f}")
+                    if position.get("trail_active"):
+                        position["trail_high"] = max(position.get("trail_high", avg_entry), price)
+                        position["trail_stop"] = position["trail_high"] * 0.992
+                        if price <= position["trail_stop"]:
+                            exits.append((sym, total_amount, avg_entry, price, position.copy()))
+                            dip_holdings.pop(sym, None)
+                if exits:
+                    persist_dip_holdings()
+            for sym, amount, avg_entry, price, position in exits:
+                pnl = (price - avg_entry) * amount
+                if LIVE_MODE:
+                    execute_sell(sym, amount)
+                with state_lock:
+                    state["realized_profit"] += pnl
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    if today != state.get("last_date"):
+                        state["last_date"] = today
+                        state["daily_profit"] = 0.0
+                    state["daily_profit"] += pnl
+                    save_state(state)
+                with dip_state_lock:
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    if today != dip_state.get("last_date"):
+                        dip_state["last_date"] = today
+                        dip_state["daily_profit"] = 0.0
+                    dip_state["realized_profit"] += pnl
+                    dip_state["daily_profit"] += pnl
+                    save_dip_state(dip_state)
+                log_trade("exit", sym, {
+                    "engine": "dip_buy",
+                    "amount": amount,
+                    "exit_price": price,
+                    "avg_entry": avg_entry,
+                    "pnl": pnl,
+                    "trail_stop": position.get("trail_stop"),
+                })
+                notify(f"[DIP] Exit {sym} PnL ${pnl:.2f}")
+                color = Fore.GREEN if pnl >= 0 else Fore.RED
+                print(color + f"[DIP] EXIT {sym} PnL ${pnl:.2f}")
+            safe_sleep(DIP_INTERVAL)
+        except ccxt.BaseError as e:
+            print(Fore.RED + f"[DIP] Exchange error: {e}")
+            safe_sleep(30)
+        except Exception as e:
+            print(Fore.RED + f"[DIP] Runtime error: {e}")
+            safe_sleep(30)
+
+
+def main():
+    print(Fore.MAGENTA + "Starting Adaptive ATR Momentum Bot v3.6 (Dual Engine)")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(run_momentum_engine),
+            executor.submit(run_dip_buy_engine),
+        ]
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        except KeyboardInterrupt:
+            print(Fore.YELLOW + "Shutting down bot...")
+            for f in futures:
+                f.cancel()
+
+
+if __name__ == "__main__":
+    main()
