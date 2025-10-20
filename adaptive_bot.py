@@ -11,7 +11,21 @@ Now includes:
 • Adaptive risk sizing and regime-aware probability thresholds
 """
 
-import os, sys, time, json, warnings, pandas as pd, numpy as np, ccxt, requests, concurrent.futures, threading
+import asyncio
+import concurrent.futures
+import gc
+import json
+import os
+import shutil
+import sys
+import threading
+import time
+import warnings
+
+import ccxt
+import numpy as np
+import pandas as pd
+import requests
 from copy import deepcopy
 from dotenv import load_dotenv
 from xgboost import XGBClassifier
@@ -112,7 +126,6 @@ DEBUG_MODE = env_bool("DEBUG_MODE", False)
 AGGRESSIVE_MODE = DISABLE_BTC_FILTER
 MAX_OPEN_POSITIONS = 5
 MAX_CAPITAL_EXPOSURE = 1.00
-THREADS = 5
 PROB_THRESHOLD = 0.52 if DISABLE_BTC_FILTER else 0.60
 HIGH_VOLATILITY_LEVEL = 0.025
 LOW_VOLATILITY_LEVEL = 0.012
@@ -131,11 +144,27 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 TRADE_LOG_DIR = Path(os.getenv("TRADE_LOG_DIR", "Logs"))
 MAX_TRADE_LOG_DAYS = int(os.getenv("MAX_TRADE_LOG_DAYS", "60"))
 CANDLE_STALENESS_TOLERANCE = int(os.getenv("CANDLE_STALENESS_TOLERANCE", "180"))
+MAX_LOG_BYTES = int(os.getenv("MAX_LOG_BYTES", str(2 * 1024 * 1024)))
+MAX_LOG_BACKUPS = int(os.getenv("MAX_LOG_BACKUPS", "5"))
+MAX_MODEL_HISTORY = int(os.getenv("MAX_MODEL_HISTORY", "5"))
+MODEL_RETENTION_SECONDS = int(os.getenv("MODEL_RETENTION_SECONDS", str(6 * 3600)))
+MAX_XGB_TREES = int(os.getenv("MAX_XGB_TREES", "256"))
+MAX_MODEL_REFIT_ROWS = int(os.getenv("MAX_MODEL_REFIT_ROWS", "500"))
+CCXT_MAX_CALLS_PER_SECOND = float(os.getenv("CCXT_MAX_CALLS_PER_SECOND", "5"))
+CCXT_QUEUE_CONCURRENCY = int(os.getenv("CCXT_QUEUE_CONCURRENCY", "1"))
+TELEGRAM_MAX_RETRIES = int(os.getenv("TELEGRAM_MAX_RETRIES", "5"))
+TELEGRAM_BASE_BACKOFF = float(os.getenv("TELEGRAM_BASE_BACKOFF", "1.0"))
+TELEGRAM_MAX_BACKOFF = float(os.getenv("TELEGRAM_MAX_BACKOFF", "30.0"))
+
+LOG_ARCHIVE_DIR = Path(LOG_DIR) / "archive"
+MODEL_ARCHIVE_DIR = Path(MODEL_DIR) / "archive"
 
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 TRADE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
 os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
@@ -158,13 +187,150 @@ RESTART_REQUESTED = threading.Event()
 _pause_reason_lock = threading.RLock()
 _pause_reason = None
 
+
+class RateLimitedTaskQueue:
+    def __init__(self, max_per_second=5.0, concurrency=1):
+        self._min_interval = 0.0 if max_per_second <= 0 else 1.0 / max_per_second
+        self._concurrency = max(1, int(concurrency or 1))
+        self._loop = asyncio.new_event_loop()
+        self._queue: asyncio.Queue | None = None
+        self._next_available = time.monotonic()
+        self._rate_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ccxt-queue", daemon=True)
+        self._thread.start()
+        self._ready.wait()
+
+    def _run(self):
+        asyncio.set_event_loop(self._loop)
+        self._queue = asyncio.Queue()
+        self._ready.set()
+        for _ in range(self._concurrency):
+            self._loop.create_task(self._worker())
+        self._loop.run_forever()
+
+    async def _worker(self):
+        while True:
+            assert self._queue is not None
+            func, args, kwargs, future = await self._queue.get()
+            try:
+                await self._acquire_slot()
+                result = await asyncio.to_thread(func, *args, **kwargs)
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+            else:
+                if not future.done():
+                    future.set_result(result)
+            finally:
+                self._queue.task_done()
+
+    async def _acquire_slot(self):
+        if self._min_interval <= 0:
+            return
+        while True:
+            with self._rate_lock:
+                now = time.monotonic()
+                wait = self._next_available - now
+                if wait <= 0:
+                    self._next_available = now + self._min_interval
+                    return
+            await asyncio.sleep(min(wait, self._min_interval))
+
+    def submit(self, func, *args, **kwargs):
+        self._ready.wait()
+        assert self._queue is not None
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _enqueue():
+            assert self._queue is not None
+            self._queue.put_nowait((func, args, kwargs, future))
+
+        self._loop.call_soon_threadsafe(_enqueue)
+        return future
+
+    def call(self, func, *args, **kwargs):
+        return self.submit(func, *args, **kwargs).result()
+
+
+ccxt_queue = RateLimitedTaskQueue(
+    max_per_second=CCXT_MAX_CALLS_PER_SECOND,
+    concurrency=CCXT_QUEUE_CONCURRENCY,
+)
+
+
+def ccxt_call(func, *args, **kwargs):
+    return ccxt_queue.call(func, *args, **kwargs)
+
+
+def ccxt_submit(func, *args, **kwargs):
+    return ccxt_queue.submit(func, *args, **kwargs)
+
 # ───────────────────────── UTILITIES ───────────────────────
-def notify(msg):
+def _prune_archives(directory: Path, stem: str, suffix: str, max_items: int):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
+        files = sorted(
+            directory.glob(f"{stem}_*{suffix}" if suffix else f"{stem}_*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in files[max_items:]:
+            try:
+                old.unlink()
+            except FileNotFoundError:
+                pass
     except Exception:
         pass
+
+
+def _roll_log_file(path: Path):
+    try:
+        if not path.exists() or path.stat().st_size < MAX_LOG_BYTES:
+            return
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        suffix = path.suffix or ""
+        archive_name = f"{path.stem}_{timestamp}{suffix}"
+        archive_path = LOG_ARCHIVE_DIR / archive_name
+        shutil.move(str(path), archive_path)
+        _prune_archives(LOG_ARCHIVE_DIR, path.stem, suffix, MAX_LOG_BACKUPS)
+    except Exception:
+        pass
+
+
+def _telegram_request(method: str, payload: dict, timeout: float = 10.0) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    delay = TELEGRAM_BASE_BACKOFF
+    last_error = None
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            response = requests.post(url, data=payload, timeout=timeout)
+            if response.status_code == 200:
+                return True
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except (TypeError, ValueError):
+                        pass
+            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+        if attempt < TELEGRAM_MAX_RETRIES:
+            time.sleep(min(delay, TELEGRAM_MAX_BACKOFF))
+            delay = min(delay * 2, TELEGRAM_MAX_BACKOFF)
+    if last_error:
+        print(Fore.RED + f"[TELEGRAM] Failed to call {method}: {last_error}")
+    else:
+        print(Fore.RED + f"[TELEGRAM] Failed to call {method}: unknown error")
+    return False
+
+
+def notify(msg):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+    return _telegram_request("sendMessage", payload)
 
 
 def log_event(name, payload):
@@ -172,6 +338,7 @@ def log_event(name, payload):
         payload = dict(payload)
         payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
         log_path = Path(LOG_DIR) / f"{name}.jsonl"
+        _roll_log_file(log_path)
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, default=str) + "\n")
     except Exception:
@@ -275,7 +442,8 @@ def safe_fetch_balance_total():
     if not LIVE_MODE:
         return {}
     try:
-        return exchange.fetch_balance().get("total", {}) or {}
+        data = ccxt_call(exchange.fetch_balance)
+        return data.get("total", {}) or {}
     except ccxt.BaseError as e:
         print(Fore.YELLOW + f"Balance sync skipped: {e}")
     except Exception as e:
@@ -285,7 +453,7 @@ def safe_fetch_balance_total():
 
 def safe_fetch_tickers():
     try:
-        return exchange.fetch_tickers()
+        return ccxt_call(exchange.fetch_tickers)
     except ccxt.BaseError as e:
         print(Fore.YELLOW + f"Ticker fetch failed: {e}")
     except Exception as e:
@@ -295,13 +463,30 @@ def safe_fetch_tickers():
 
 def fetch_symbol_ohlcv(sym, limit):
     try:
-        raw = exchange.fetch_ohlcv(sym, timeframe, limit=limit)
+        raw = ccxt_call(exchange.fetch_ohlcv, sym, timeframe, limit=limit)
         return pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
     except ccxt.BaseError as e:
         print(Fore.LIGHTBLACK_EX + f"Data fetch failed for {sym}: {e}")
     except Exception as e:
         print(Fore.LIGHTBLACK_EX + f"Data fetch error {sym}: {e}")
     return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "vol"])
+
+
+def fetch_symbol_ohlcv_batch(symbols, limit):
+    futures = {sym: ccxt_submit(exchange.fetch_ohlcv, sym, timeframe, limit=limit) for sym in symbols}
+    results = []
+    for sym in symbols:
+        try:
+            raw = futures[sym].result()
+            df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
+        except ccxt.BaseError as e:
+            print(Fore.LIGHTBLACK_EX + f"Data fetch failed for {sym}: {e}")
+            df = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "vol"])
+        except Exception as e:
+            print(Fore.LIGHTBLACK_EX + f"Data fetch error {sym}: {e}")
+            df = pd.DataFrame(columns=["ts", "open", "high", "low", "close", "vol"])
+        results.append((sym, df))
+    return results
 
 
 def candle_is_fresh(df):
@@ -632,6 +817,20 @@ def available_capital_for_engine(momentum_holdings, dip_holdings, engine):
 def snapshot_holdings(src_holdings):
     return deepcopy(src_holdings)
 
+
+def prune_inactive_models(models, active_symbols, holdings_snapshot):
+    protected = set(active_symbols) | set(holdings_snapshot.keys())
+    now = time.time()
+    for sym, model in list(models.items()):
+        if sym in protected:
+            continue
+        try:
+            last_train = float(getattr(model, "last_train", 0) or 0)
+        except (TypeError, ValueError):
+            last_train = 0
+        if now - last_train > MODEL_RETENTION_SECONDS:
+            models.pop(sym, None)
+
 # ───────────────────────── MODEL ───────────────────────────
 class SymbolModel:
     def __init__(self, sym):
@@ -672,11 +871,52 @@ class SymbolModel:
 
     def _save(self):
         try:
+            self._archive_existing()
             self.model.save_model(self.model_path)
             json.dump({"mean": self.scaler.mean_.tolist(),
                        "scale": self.scaler.scale_.tolist()}, open(self.scaler_path, "w"))
             self.performance["last_train_rows"] = int(self.last_train_rows)
             json.dump(self.performance, open(self.meta_path, "w"), indent=2)
+        except Exception:
+            pass
+
+    def _archive_existing(self):
+        try:
+            stem = self.sym.replace('/', '_')
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            if os.path.exists(self.model_path):
+                archive_path = MODEL_ARCHIVE_DIR / f"{stem}_{timestamp}.json"
+                shutil.copy2(self.model_path, archive_path)
+                _prune_archives(MODEL_ARCHIVE_DIR, stem, ".json", MAX_MODEL_HISTORY)
+        except Exception:
+            pass
+
+    def _enforce_booster_budget(self, features, labels):
+        if not self.trained:
+            return
+        try:
+            booster = self.model.get_booster()
+            try:
+                num_trees = len(booster.get_dump(dump_format="json"))
+            except TypeError:
+                num_trees = len(booster.get_dump())
+        except Exception:
+            return
+        if num_trees <= MAX_XGB_TREES:
+            return
+        if len(features) == 0 or len(labels) == 0:
+            return
+        refit_X = features[-MAX_MODEL_REFIT_ROWS:]
+        refit_y = labels[-MAX_MODEL_REFIT_ROWS:]
+        try:
+            fresh_model = XGBClassifier(
+                eval_metric="logloss",
+                n_estimators=self.model.get_params().get("n_estimators", 100),
+                max_depth=self.model.get_params().get("max_depth", 3),
+            )
+            fresh_model.fit(refit_X, refit_y)
+            self.model = fresh_model
+            gc.collect()
         except Exception:
             pass
 
@@ -747,11 +987,13 @@ class SymbolModel:
                     X_val_raw, y_val = np.empty((0, recent_X.shape[1])), np.array([])
 
                 self.scaler.fit(X_train_raw)
-                X_train = self.scaler.transform(X_train_raw)
+                scaled_recent = self.scaler.transform(recent_X)
                 if val_size:
-                    X_val = self.scaler.transform(X_val_raw)
+                    X_train = scaled_recent[:-val_size]
+                    X_val = scaled_recent[-val_size:]
                 else:
-                    X_val = np.empty((0, X_train.shape[1]))
+                    X_train = scaled_recent
+                    X_val = np.empty((0, scaled_recent.shape[1]))
 
                 try:
                     if self.trained:
@@ -798,6 +1040,7 @@ class SymbolModel:
                 wf = self.walk_forward_validate(df)
                 if wf:
                     self.performance.update(wf)
+                self._enforce_booster_budget(scaled_recent, recent_y)
                 self._save()
         except Exception:
             pass
@@ -955,7 +1198,7 @@ def execute_buy(sym, amt, price_hint=None):
         price = price_hint
         if price is None:
             try:
-                ticker = exchange.fetch_ticker(sym)
+                ticker = ccxt_call(exchange.fetch_ticker, sym)
                 price = float(ticker.get("last") or ticker.get("close") or 0.0)
             except Exception:
                 price = None
@@ -967,7 +1210,7 @@ def execute_buy(sym, amt, price_hint=None):
         return order
     try:
         for attempt in range(2):
-            ticker = exchange.fetch_ticker(sym)
+            ticker = ccxt_call(exchange.fetch_ticker, sym)
             current_price = float(ticker.get("last") or ticker.get("close") or ticker.get("bid") or ticker.get("ask") or 0.0)
             if current_price <= 0:
                 raise ValueError("Invalid price for buy order")
@@ -976,7 +1219,7 @@ def execute_buy(sym, amt, price_hint=None):
             start = time.time()
             while time.time() - start < 60:
                 try:
-                    status = exchange.fetch_order(order["id"], sym)
+                    status = ccxt_call(exchange.fetch_order, order["id"], sym)
                 except Exception:
                     time.sleep(2)
                     continue
@@ -1002,7 +1245,7 @@ def execute_sell(sym, amt, price_hint=None):
         price = price_hint
         if price is None:
             try:
-                ticker = exchange.fetch_ticker(sym)
+                ticker = ccxt_call(exchange.fetch_ticker, sym)
                 price = float(ticker.get("last") or ticker.get("close") or 0.0)
             except Exception:
                 price = None
@@ -1014,7 +1257,7 @@ def execute_sell(sym, amt, price_hint=None):
         return order
     try:
         for attempt in range(2):
-            ticker = exchange.fetch_ticker(sym)
+            ticker = ccxt_call(exchange.fetch_ticker, sym)
             current_price = float(ticker.get("last") or ticker.get("close") or ticker.get("bid") or ticker.get("ask") or 0.0)
             if current_price <= 0:
                 raise ValueError("Invalid price for sell order")
@@ -1023,7 +1266,7 @@ def execute_sell(sym, amt, price_hint=None):
             start = time.time()
             while time.time() - start < 60:
                 try:
-                    status = exchange.fetch_order(order["id"], sym)
+                    status = ccxt_call(exchange.fetch_order, order["id"], sym)
                 except Exception:
                     time.sleep(2)
                     continue
@@ -1065,7 +1308,7 @@ def build_exchange_holding(sym, amt, price=None):
     if sym not in markets:
         return None
     try:
-        ticker = exchange.fetch_ticker(sym) if price is None else {"last": price}
+        ticker = ccxt_call(exchange.fetch_ticker, sym) if price is None else {"last": price}
         last_price = float(ticker.get("last") or ticker.get("close") or 0.0)
     except Exception as e:
         print(Fore.LIGHTBLACK_EX + f"Skip holding sync for {sym}: {e}")
@@ -1323,8 +1566,8 @@ def run_momentum_engine():
             symbols = discover_symbols()
             for s in symbols:
                 models.setdefault(s, SymbolModel(s))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as ex:
-                data = list(ex.map(lambda sym: (sym, fetch_symbol_ohlcv(sym, slow_ema + 120)), symbols))
+            prune_inactive_models(models, symbols, holdings_snapshot)
+            data = fetch_symbol_ohlcv_batch(symbols, slow_ema + 120)
             tickers = safe_fetch_tickers()
             data_dict = {sym: df for sym, df in data}
             for held_sym in holdings_snapshot.keys():
