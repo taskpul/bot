@@ -119,6 +119,7 @@ DIPBUY_CAPITAL_RATIO = 0.5
 DIP_STATE_FILE = "dip_state.json"
 DIP_SYMBOLS = ["BTC/USDC", "ETH/USDC", "BNB/USDC"]
 DIP_INTERVAL = 60
+DIP_EXIT_COOLDOWN_SECONDS = int(os.getenv("DIP_EXIT_COOLDOWN_SECONDS", str(3600)))
 MODEL_DIR = "models"
 LIVE_MODE = env_bool("LIVE_MODE", False)
 DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", False)
@@ -383,6 +384,24 @@ def log_trade(event_type, symbol, context):
         pass
 
 
+def dip_cooldown_status(symbol, now=None):
+    if now is None:
+        now = datetime.now(timezone.utc)
+    with dip_state_lock:
+        last_exit_map = dip_state.setdefault("last_exit", {})
+        ts = last_exit_map.get(symbol)
+    if not ts:
+        return 0.0
+    try:
+        exit_time = datetime.fromisoformat(ts)
+    except ValueError:
+        return 0.0
+    if exit_time.tzinfo is None:
+        exit_time = exit_time.replace(tzinfo=timezone.utc)
+    remaining = DIP_EXIT_COOLDOWN_SECONDS - (now - exit_time).total_seconds()
+    return remaining if remaining > 0 else 0.0
+
+
 def _paper_trade(event_type, symbol, amount, price=None, reason=None):
     context = {
         "mode": "paper",
@@ -557,6 +576,7 @@ def load_dip_state():
             data.setdefault("realized_profit", 0.0)
             data.setdefault("daily_profit", 0.0)
             data.setdefault("last_date", datetime.now().strftime("%Y-%m-%d"))
+            data.setdefault("last_exit", {})
             return data
         except Exception:
             pass
@@ -564,7 +584,8 @@ def load_dip_state():
         "holdings": {},
         "realized_profit": 0.0,
         "daily_profit": 0.0,
-        "last_date": datetime.now().strftime("%Y-%m-%d")
+        "last_date": datetime.now().strftime("%Y-%m-%d"),
+        "last_exit": {},
     }
 
 
@@ -579,6 +600,7 @@ dip_state_lock = threading.RLock()
 momentum_holdings_lock = threading.RLock()
 dip_holdings_lock = threading.RLock()
 dip_holdings = dip_state.setdefault("holdings", {})
+dip_state.setdefault("last_exit", {})
 momentum_holdings = {}
 _state_sync_notice = threading.Event()
 
@@ -1817,6 +1839,7 @@ def run_dip_buy_engine():
                 safe_sleep(DIP_INTERVAL)
                 continue
             market_info = {}
+            now_utc = datetime.now(timezone.utc)
             for sym in DIP_SYMBOLS:
                 df = fetch_symbol_ohlcv(sym, max(60, slow_ema))
                 if df.empty:
@@ -1843,6 +1866,11 @@ def run_dip_buy_engine():
             total_budget = effective_capital() * MAX_CAPITAL_EXPOSURE * DIPBUY_CAPITAL_RATIO
             # Entry management
             for sym, info in market_info.items():
+                cooldown_remaining = dip_cooldown_status(sym, now_utc)
+                if cooldown_remaining > 0:
+                    minutes_left = cooldown_remaining / 60.0
+                    print(Fore.YELLOW + f"[DIP] Cooldown active for {sym}: {minutes_left:.1f}m remaining")
+                    continue
                 price = info["price"]
                 recent_high = info["recent_high"]
                 if recent_high <= 0:
@@ -1937,23 +1965,26 @@ def run_dip_buy_engine():
                 if exits:
                     persist_dip_holdings()
             for sym, amount, avg_entry, price, position in exits:
+                exit_time = datetime.now(timezone.utc)
+                exit_time_str = exit_time.isoformat()
                 pnl = (price - avg_entry) * amount
                 execute_sell(sym, amount, price)
                 with state_lock:
                     state["realized_profit"] += pnl
-                    today = datetime.now().strftime("%Y-%m-%d")
+                    today = exit_time.strftime("%Y-%m-%d")
                     if today != state.get("last_date"):
                         state["last_date"] = today
                         state["daily_profit"] = 0.0
                     state["daily_profit"] += pnl
                     save_state(state)
                 with dip_state_lock:
-                    today = datetime.now().strftime("%Y-%m-%d")
+                    today = exit_time.strftime("%Y-%m-%d")
                     if today != dip_state.get("last_date"):
                         dip_state["last_date"] = today
                         dip_state["daily_profit"] = 0.0
                     dip_state["realized_profit"] += pnl
                     dip_state["daily_profit"] += pnl
+                    dip_state.setdefault("last_exit", {})[sym] = exit_time_str
                     save_dip_state(dip_state)
                 log_trade("exit", sym, {
                     "engine": "dip_buy",
@@ -1962,6 +1993,7 @@ def run_dip_buy_engine():
                     "avg_entry": avg_entry,
                     "pnl": pnl,
                     "trail_stop": position.get("trail_stop"),
+                    "exit_reason": "trail_stop_hit",
                 })
                 notify(f"[DIP] Exit {sym} PnL ${pnl:.2f}")
                 color = Fore.GREEN if pnl >= 0 else Fore.RED
