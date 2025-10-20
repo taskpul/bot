@@ -91,6 +91,16 @@ _application_thread: Optional[threading.Thread] = None
 _application_ready = threading.Event()
 
 
+def _describe_update(update: Update) -> str:
+    chat = update.effective_chat if update else None
+    user = update.effective_user if update else None
+    chat_id = getattr(chat, "id", None)
+    username = getattr(user, "username", None)
+    full_name = getattr(user, "full_name", None)
+    identity = username or full_name or "unknown"
+    return f"chat_id={chat_id} user={identity}"
+
+
 def _build_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -119,8 +129,10 @@ async def _ensure_authorized(update: Update) -> bool:
     """Validate that the incoming update originates from the configured chat."""
 
     if _authorized(update):
+        _logger.debug("Authorized update from %s", _describe_update(update))
         return True
 
+    _logger.warning("Unauthorized update from %s", _describe_update(update))
     if update.callback_query:
         try:
             await update.callback_query.answer(text="Unauthorized", show_alert=True)
@@ -305,20 +317,39 @@ async def _send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, view:
     if not await _ensure_authorized(update):
         return
     context.chat_data["dashboard_view"] = view
+    _logger.info("Preparing %s view for %s", view, _describe_update(update))
     text = await asyncio.to_thread(_build_report, view)
     reply_markup = _build_keyboard()
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        try:
-            await query.edit_message_text(text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
-        except Exception as exc:
-            _logger.debug("Edit message failed: %s", exc)
-    elif update.effective_message:
-        await update.effective_message.reply_text(text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+    try:
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=reply_markup,
+                )
+            except Exception as exc:
+                _logger.debug("Edit message failed: %s", exc)
+                if update.effective_message:
+                    await update.effective_message.reply_text(
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=reply_markup,
+                    )
+        elif update.effective_message:
+            await update.effective_message.reply_text(
+                text=text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=reply_markup,
+            )
+    except Exception as exc:
+        _logger.exception("Failed to send dashboard report: %s", exc)
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received resume command from %s", _describe_update(update))
     if not await _ensure_authorized(update):
         return
     resume_engines()
@@ -329,6 +360,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received pause command from %s", _describe_update(update))
     if not await _ensure_authorized(update):
         return
     pause_engines("Paused via Telegram")
@@ -339,6 +371,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received restart command from %s", _describe_update(update))
     if not await _ensure_authorized(update):
         return
     request_restart()
@@ -349,18 +382,22 @@ async def handle_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received report command from %s", _describe_update(update))
     await _send_report(update, context, "report")
 
 
 async def handle_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received positions command from %s", _describe_update(update))
     await _send_report(update, context, "positions")
 
 
 async def handle_performance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received performance command from %s", _describe_update(update))
     await _send_report(update, context, "performance")
 
 
 async def handle_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received refresh command from %s", _describe_update(update))
     if not await _ensure_authorized(update):
         return
     view = context.chat_data.get("dashboard_view", "report")
@@ -368,6 +405,7 @@ async def handle_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_root_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _logger.info("Received start command from %s", _describe_update(update))
     if not await _ensure_authorized(update):
         return
     resume_engines()
@@ -375,6 +413,7 @@ async def handle_root_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 def _register_handlers(application: Application) -> None:
+    _logger.debug("Registering Telegram command and callback handlers")
     application.add_handler(CommandHandler("start", handle_root_start))
     application.add_handler(CommandHandler("report", handle_report))
     application.add_handler(CommandHandler("positions", handle_positions))
@@ -390,40 +429,49 @@ def _register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(handle_restart, pattern="^restart$"))
 
 
-async def _run_application() -> None:
+def _run_application() -> None:
     if not PTB_AVAILABLE or not TOKEN or not AUTHORIZED_CHAT_ID:
-        _logger.warning("Telegram dashboard disabled (PTB=%s, token=%s, chat_id=%s)", PTB_AVAILABLE, bool(TOKEN), bool(AUTHORIZED_CHAT_ID))
+        _logger.warning(
+            "Telegram dashboard disabled (PTB=%s, token=%s, chat_id=%s)",
+            PTB_AVAILABLE,
+            bool(TOKEN),
+            bool(AUTHORIZED_CHAT_ID),
+        )
         return
+
     application = Application.builder().token(TOKEN).build()
     _register_handlers(application)
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+    _logger.info("Starting Telegram polling for chat %s", AUTHORIZED_CHAT_ID)
     _application_ready.set()
     try:
-        await application.updater.idle()
+        application.run_polling(stop_signals=None, close_loop=False)
     finally:
-        await application.shutdown()
-        await application.stop()
+        _logger.info("Telegram polling stopped")
+        _application_ready.clear()
 
 
 def _thread_target() -> None:
     try:
-        asyncio.run(_run_application())
+        _run_application()
     except Exception as exc:  # pragma: no cover - background thread guard
-        _logger.error("Telegram dashboard crashed: %s", exc)
+        _logger.exception("Telegram dashboard crashed: %s", exc)
 
 
 def ensure_started() -> None:
     if not PTB_AVAILABLE or not TOKEN or not AUTHORIZED_CHAT_ID:
         return
     global _application_thread
+    started = False
     with _application_lock:
         if _application_thread and _application_thread.is_alive():
             return
+        _application_ready.clear()
         logging.getLogger("telegram").setLevel(logging.INFO)
         _application_thread = threading.Thread(target=_thread_target, name="telegram-dashboard", daemon=True)
         _application_thread.start()
+        started = True
+    if started and not _application_ready.wait(timeout=10.0):
+        _logger.warning("Telegram dashboard thread did not signal readiness within 10s")
 
 
 __all__ = [
