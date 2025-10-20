@@ -542,7 +542,8 @@ def load_state():
 
 def save_state(s):
     with state_lock:
-        json.dump(s, open(STATE_FILE, "w"), indent=2)
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(s, fh, indent=2)
 
 state = load_state()
 state_lock = threading.RLock()
@@ -569,7 +570,7 @@ def load_dip_state():
 
 def save_dip_state(s):
     with dip_state_lock:
-        with open(DIP_STATE_FILE, "w") as fh:
+        with open(DIP_STATE_FILE, "w", encoding="utf-8") as fh:
             json.dump(s, fh, indent=2)
 
 
@@ -579,6 +580,44 @@ momentum_holdings_lock = threading.RLock()
 dip_holdings_lock = threading.RLock()
 dip_holdings = dip_state.setdefault("holdings", {})
 momentum_holdings = {}
+_state_sync_notice = threading.Event()
+
+
+def sync_state_files_for_telegram(state_snapshot=None, dip_state_snapshot=None):
+    """Persist the latest dashboard state so Telegram always has fresh data."""
+
+    state_missing = not os.path.exists(STATE_FILE)
+    dip_missing = not os.path.exists(DIP_STATE_FILE)
+    try:
+        if not state_missing and os.path.getsize(STATE_FILE) == 0:
+            state_missing = True
+    except OSError:
+        state_missing = True
+    try:
+        if not dip_missing and os.path.getsize(DIP_STATE_FILE) == 0:
+            dip_missing = True
+    except OSError:
+        dip_missing = True
+
+    if state_snapshot is None:
+        with state_lock:
+            state_snapshot = deepcopy(state)
+    if dip_state_snapshot is None:
+        with dip_state_lock:
+            dip_state_snapshot = deepcopy(dip_state)
+
+    try:
+        save_state(state_snapshot)
+    except Exception as exc:
+        print(Fore.RED + f"[SYNC] Failed to persist dashboard state: {exc}")
+    try:
+        save_dip_state(dip_state_snapshot)
+    except Exception as exc:
+        print(Fore.RED + f"[SYNC] Failed to persist dip state: {exc}")
+
+    if (state_missing or dip_missing) and not _state_sync_notice.is_set():
+        print(Fore.CYAN + "[SYNC] State files rebuilt from live data for Telegram bot.")
+        _state_sync_notice.set()
 
 
 def persist_dip_holdings():
@@ -1525,10 +1564,15 @@ def render_status(tickers, interval, next_sym, next_prob, current_risk, threshol
         state_snapshot = deepcopy(state)
     with dip_state_lock:
         dip_state_snapshot = deepcopy(dip_state)
+    state_snapshot.setdefault("holdings_snapshot", {})
+    state_snapshot["holdings_snapshot"] = momentum_snapshot
+    dip_state_snapshot.setdefault("holdings", {})
+    dip_state_snapshot["holdings"] = dip_snapshot
     if DEBUG_MODE:
         print_debug_status(tickers, momentum_snapshot, dip_snapshot, state_snapshot, dip_state_snapshot, interval, next_sym, next_prob, current_risk, threshold, btc_ctx)
     else:
         print_dashboard(tickers, momentum_snapshot, dip_snapshot, state_snapshot, dip_state_snapshot, interval, next_sym, next_prob, current_risk, threshold, btc_ctx)
+    sync_state_files_for_telegram(state_snapshot, dip_state_snapshot)
 
 # ───────────────────────── ENGINE RUNNERS ───────────────────────
 def run_momentum_engine():
