@@ -46,9 +46,9 @@ timeframe = "30m"
 
 fast_ema, slow_ema, rsi_period, atr_period = 9, 21, 14, 14
 ATR_SL_MULT, ATR_TP_MULT, TRAIL_FACTOR = 1.8, 4.0, 0.6
-BASE_RISK_PERCENT = 0.015
-MIN_RISK_PERCENT = 0.02
-MAX_RISK_PERCENT = 0.03
+BASE_RISK_PERCENT = 0.05
+MIN_RISK_PERCENT = 0.05
+MAX_RISK_PERCENT = 0.05
 RISK_STEP = 0.02
 RISK_LOOKBACK = 12
 BASE_CAPITAL = 1200.0
@@ -1113,10 +1113,12 @@ while True:
                 corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
                 if AGGRESSIVE_MODE or corr < MAX_SYMBOL_CORRELATION:
                     used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
-                    if used_cap < effective_capital() * MAX_CAPITAL_EXPOSURE:
+                    remaining_cap = max(effective_capital() * MAX_CAPITAL_EXPOSURE - used_cap, 0)
+                    if remaining_cap <= 0:
+                        log_decision(best_sym, {"reason": "no_remaining_cap", "used_cap": used_cap})
+                    else:
                         per_trade_capital = effective_capital() / MAX_OPEN_POSITIONS
-                        max_alloc = max(effective_capital() * MAX_CAPITAL_EXPOSURE - used_cap, 0)
-                        alloc = min(per_trade_capital, max_alloc)
+                        alloc = min(per_trade_capital, remaining_cap)
                         if alloc > 0:
                             amt = alloc / best_price
                             if LIVE_MODE:
@@ -1162,13 +1164,13 @@ while True:
             target_stop = entry_price * 0.98
             if gain_ratio >= 0.05:
                 target_stop = trail_high * 0.98
-            elif gain_ratio >= 0.04:
-                target_stop = entry_price * 1.03
             elif gain_ratio >= 0.03:
                 target_stop = entry_price * 1.02
             elif gain_ratio >= 0.02:
                 target_stop = entry_price * 1.01
             elif gain_ratio >= 0.01:
+                target_stop = entry_price * 1.005
+            elif gain_ratio >= 0.005:
                 target_stop = entry_price
 
             h["stop_loss"] = max(h["stop_loss"], target_stop)
