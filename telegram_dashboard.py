@@ -439,6 +439,7 @@ def _run_application() -> None:
         )
         return
 
+    asyncio.set_event_loop(asyncio.new_event_loop())
     application = Application.builder().token(TOKEN).build()
     _register_handlers(application)
     _logger.info("Starting Telegram polling for chat %s", AUTHORIZED_CHAT_ID)
