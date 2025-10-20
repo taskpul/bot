@@ -58,7 +58,7 @@ LIVE_MODE = env_bool("LIVE_MODE", False)
 DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", False)
 DEBUG_MODE = env_bool("DEBUG_MODE", False)
 AGGRESSIVE_MODE = DISABLE_BTC_FILTER
-MAX_OPEN_POSITIONS = 3
+MAX_OPEN_POSITIONS = 5
 MAX_CAPITAL_EXPOSURE = 1.00
 THREADS = 5
 PROB_THRESHOLD = 0.52 if DISABLE_BTC_FILTER else 0.60
@@ -156,6 +156,37 @@ def log_trade(event_type, symbol, context):
         _prune_trade_logs()
     except Exception:
         pass
+
+
+def apply_uniform_risk_controls(position, current_price):
+    try:
+        entry_price = float(position.get("entry_price", 0) or 0)
+        price = float(current_price or 0)
+    except (TypeError, ValueError):
+        return
+    if entry_price <= 0 or price <= 0:
+        return
+
+    trail_high = max(float(position.get("trail_high", entry_price) or entry_price), price)
+    position["trail_high"] = trail_high
+
+    base_stop = entry_price * 0.98
+    existing_stop = float(position.get("stop_loss", base_stop) or base_stop)
+    gain_ratio = (price - entry_price) / entry_price
+
+    target_stop = base_stop
+    if gain_ratio >= 0.05:
+        target_stop = trail_high * 0.98
+    elif gain_ratio >= 0.03:
+        target_stop = entry_price * 1.02
+    elif gain_ratio >= 0.02:
+        target_stop = entry_price * 1.01
+    elif gain_ratio >= 0.01:
+        target_stop = entry_price * 1.005
+    elif gain_ratio >= 0.005:
+        target_stop = entry_price
+
+    position["stop_loss"] = max(existing_stop, target_stop)
 
 
 def safe_fetch_balance_total():
@@ -849,14 +880,13 @@ def build_exchange_holding(sym, amt, price=None):
     entry = {
         "amount": amount,
         "entry_price": last_price,
-        "stop_loss": last_price * 0.98,
         "expected_return": 0.0,
         "expected_prob": 0.0,
         "expected_pnl": 0.0,
         "entry_time": datetime.now(timezone.utc).isoformat(),
         "source": "exchange",
-        "trail_high": last_price,
     }
+    apply_uniform_risk_controls(entry, last_price)
     return entry
 
 
@@ -868,6 +898,7 @@ def load_existing_holdings():
         if normalized:
             value = normalized["amount"] * normalized["entry_price"]
             holdings[sym] = normalized
+            apply_uniform_risk_controls(holdings[sym], normalized["entry_price"])
             print(Fore.CYAN + f"Recovered {sym} from snapshot: {normalized['amount']:.6f} (${value:.2f})")
 
     balances = safe_fetch_balance_total()
@@ -1124,7 +1155,9 @@ while True:
                     else:
                         per_trade_capital = effective_capital() / MAX_OPEN_POSITIONS
                         alloc = min(per_trade_capital, remaining_cap)
-                        if alloc > 0:
+                        if alloc < MIN_HOLD_VALUE:
+                            log_decision(best_sym, {"reason": "allocation_below_min", "allocation": alloc})
+                        elif alloc > 0:
                             amt = alloc / best_price
                             if LIVE_MODE:
                                 execute_buy(best_sym, amt)
@@ -1132,14 +1165,13 @@ while True:
                             holdings[best_sym] = {
                                 "amount": amt,
                                 "entry_price": best_price,
-                                "stop_loss": best_price * 0.98,
                                 "expected_return": best_expected,
                                 "expected_prob": best_prob,
                                 "expected_pnl": expected_pnl,
                                 "entry_time": datetime.now(timezone.utc).isoformat(),
                                 "source": "bot",
-                                "trail_high": best_price,
                             }
+                            apply_uniform_risk_controls(holdings[best_sym], best_price)
                             log_trade("entry", best_sym, {
                                 "amount": amt,
                                 "price": best_price,
@@ -1160,25 +1192,8 @@ while True:
                 continue
             price = tickers[sym]["last"]
             entry_price = h["entry_price"]
+            apply_uniform_risk_controls(h, price)
             pnl = (price - entry_price) * h["amount"]
-            gain_ratio = (price - entry_price) / entry_price
-
-            trail_high = max(h.get("trail_high", entry_price), price)
-            h["trail_high"] = trail_high
-
-            target_stop = entry_price * 0.98
-            if gain_ratio >= 0.05:
-                target_stop = trail_high * 0.98
-            elif gain_ratio >= 0.03:
-                target_stop = entry_price * 1.02
-            elif gain_ratio >= 0.02:
-                target_stop = entry_price * 1.01
-            elif gain_ratio >= 0.01:
-                target_stop = entry_price * 1.005
-            elif gain_ratio >= 0.005:
-                target_stop = entry_price
-
-            h["stop_loss"] = max(h["stop_loss"], target_stop)
 
             if price <= h["stop_loss"]:
                 pnl = (price - entry_price) * h["amount"]
