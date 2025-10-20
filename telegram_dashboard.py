@@ -115,6 +115,39 @@ def _authorized(update: Update) -> bool:
     return str(chat.id) == AUTHORIZED_CHAT_ID
 
 
+async def _ensure_authorized(update: Update) -> bool:
+    """Validate that the incoming update originates from the configured chat."""
+
+    if _authorized(update):
+        return True
+
+    if update.callback_query:
+        try:
+            await update.callback_query.answer(text="Unauthorized", show_alert=True)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    message_lines = ["⛔️ This bot is restricted to a different Telegram chat."]
+
+    if AUTHORIZED_CHAT_ID:
+        message_lines.append(f"Allowed chat ID : {AUTHORIZED_CHAT_ID}")
+        chat = update.effective_chat
+        if chat is not None:
+            message_lines.append(f"Your chat ID    : {chat.id}")
+    else:
+        message_lines.append(
+            "Telegram chat access is not configured. Set TELEGRAM_CHAT_ID to enable control."
+        )
+
+    if update.effective_message:
+        try:
+            await update.effective_message.reply_text("\n".join(message_lines))
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    return False
+
+
 def _escape(text: str) -> str:
     if not PTB_AVAILABLE:
         return text
@@ -269,7 +302,7 @@ def _build_report(view: str = "report") -> str:
 
 
 async def _send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, view: str) -> None:
-    if not _authorized(update):
+    if not await _ensure_authorized(update):
         return
     context.chat_data["dashboard_view"] = view
     text = await asyncio.to_thread(_build_report, view)
@@ -286,7 +319,7 @@ async def _send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, view:
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
+    if not await _ensure_authorized(update):
         return
     resume_engines()
     if update.callback_query:
@@ -296,7 +329,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
+    if not await _ensure_authorized(update):
         return
     pause_engines("Paused via Telegram")
     if update.callback_query:
@@ -306,7 +339,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
+    if not await _ensure_authorized(update):
         return
     request_restart()
     if update.callback_query:
@@ -328,16 +361,14 @@ async def handle_performance(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        if update.callback_query:
-            await update.callback_query.answer()
+    if not await _ensure_authorized(update):
         return
     view = context.chat_data.get("dashboard_view", "report")
     await _send_report(update, context, view)
 
 
 async def handle_root_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
+    if not await _ensure_authorized(update):
         return
     resume_engines()
     await _send_report(update, context, "report")
