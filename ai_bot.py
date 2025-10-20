@@ -1026,8 +1026,13 @@ if DEBUG_MODE:
 else:
     print(Fore.YELLOW + "Dashboard mode active. Set DEBUG_MODE=1 to view streaming logs.")
 
+last_heartbeat = 0.0
 while True:
     try:
+        now = time.time()
+        if now - last_heartbeat >= 3600:
+            notify("✅ AI Momentum Bot is alive and working normally.")
+            last_heartbeat = now
         sync_holdings_with_exchange(holdings)
         btc_ctx = fetch_btc_context()
         if not DISABLE_BTC_FILTER:
