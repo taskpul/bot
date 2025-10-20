@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import threading
+import json
 from copy import deepcopy
 from datetime import datetime, timezone
 from statistics import mean, pstdev
@@ -13,6 +14,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
+
+STATE_FILE = "adaptive_dynamic_dashboard_state.json"
+DIP_STATE_FILE = "dip_state.json"
 
 try:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -34,6 +38,8 @@ try:  # pragma: no cover - bot module may be absent during tests
     momentum_holdings_lock = adaptive_bot.momentum_holdings_lock
     dip_holdings = adaptive_bot.dip_holdings
     dip_holdings_lock = adaptive_bot.dip_holdings_lock
+    STATE_FILE = getattr(adaptive_bot, "STATE_FILE", STATE_FILE)
+    DIP_STATE_FILE = getattr(adaptive_bot, "DIP_STATE_FILE", DIP_STATE_FILE)
     effective_capital = adaptive_bot.effective_capital
     momentum_used_capital = adaptive_bot.momentum_used_capital
     dip_used_capital = adaptive_bot.dip_used_capital
@@ -185,14 +191,93 @@ def _current_price(symbol: str, tickers: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _default_state_payload() -> Dict[str, Any]:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {
+        "realized_profit": 0.0,
+        "daily_profit": 0.0,
+        "last_date": today,
+        "trade_history": [],
+        "current_risk_percent": 0.0,
+        "expected_realized_history": [],
+        "threshold_bias": 0.0,
+        "holdings_snapshot": {},
+    }
+
+
+def _default_dip_payload() -> Dict[str, Any]:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {
+        "holdings": {},
+        "realized_profit": 0.0,
+        "daily_profit": 0.0,
+        "last_date": today,
+    }
+
+
+def _load_json_dict(path: str) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return None
+    except OSError:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        _logger.debug("Failed to load %s: %s", path, exc)
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _load_persisted_state_snapshots() -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    state_defaults = _default_state_payload()
+    state_data = _load_json_dict(STATE_FILE)
+    if not state_data:
+        state_data = deepcopy(state_defaults)
+    else:
+        for key, value in state_defaults.items():
+            if isinstance(value, dict):
+                state_data.setdefault(key, deepcopy(value))
+            else:
+                state_data.setdefault(key, value)
+    holdings_snapshot = state_data.get("holdings_snapshot")
+    if not isinstance(holdings_snapshot, dict):
+        holdings_snapshot = {}
+    holdings_snapshot_copy = deepcopy(holdings_snapshot)
+    state_data["holdings_snapshot"] = deepcopy(holdings_snapshot_copy)
+    dip_defaults = _default_dip_payload()
+    dip_data = _load_json_dict(DIP_STATE_FILE)
+    if not dip_data:
+        dip_data = deepcopy(dip_defaults)
+    else:
+        for key, value in dip_defaults.items():
+            if isinstance(value, dict):
+                dip_data.setdefault(key, deepcopy(value))
+            else:
+                dip_data.setdefault(key, value)
+    dip_snapshot = dip_data.get("holdings")
+    if not isinstance(dip_snapshot, dict):
+        dip_snapshot = {}
+    dip_snapshot_copy = deepcopy(dip_snapshot)
+    dip_data["holdings"] = deepcopy(dip_snapshot_copy)
+    return state_data, holdings_snapshot_copy, dip_snapshot_copy
+
+
 def _snapshot_state() -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    with state_lock:
-        state_snapshot = deepcopy(state)
-    with momentum_holdings_lock:
-        momentum_snapshot = deepcopy(momentum_holdings)
-    with dip_holdings_lock:
-        dip_snapshot = deepcopy(dip_holdings)
-    return state_snapshot, momentum_snapshot, dip_snapshot
+    if adaptive_bot is not None:
+        with state_lock:
+            state_snapshot = deepcopy(state)
+        with momentum_holdings_lock:
+            momentum_snapshot = deepcopy(momentum_holdings)
+        with dip_holdings_lock:
+            dip_snapshot = deepcopy(dip_holdings)
+        return state_snapshot, momentum_snapshot, dip_snapshot
+    return _load_persisted_state_snapshots()
 
 
 def _performance_metrics(trade_history: Iterable[float]) -> Tuple[float, float, float]:
