@@ -58,10 +58,9 @@ LIVE_MODE = env_bool("LIVE_MODE", False)
 DISABLE_BTC_FILTER = env_bool("DISABLE_BTC_FILTER", False)
 DEBUG_MODE = env_bool("DEBUG_MODE", False)
 AGGRESSIVE_MODE = DISABLE_BTC_FILTER
-MAX_OPEN_POSITIONS = 5
-MAX_CAPITAL_EXPOSURE = 0.40
+MAX_OPEN_POSITIONS = 3
+MAX_CAPITAL_EXPOSURE = 1.00
 THREADS = 5
-lock_factor = 0.5
 PROB_THRESHOLD = 0.52 if DISABLE_BTC_FILTER else 0.60
 HIGH_VOLATILITY_LEVEL = 0.025
 LOW_VOLATILITY_LEVEL = 0.012
@@ -261,16 +260,17 @@ def _normalize_holding_entry(sym, entry, default_source="bot"):
         return None
     if amount * price < MIN_HOLD_VALUE:
         return None
+    default_stop = price * 0.98
     normalized = {
         "amount": amount,
         "entry_price": price,
-        "stop_loss": float(entry.get("stop_loss", price) or price),
-        "take_profit": float(entry.get("take_profit", price) or price),
+        "stop_loss": float(entry.get("stop_loss", default_stop) or default_stop),
         "expected_return": float(entry.get("expected_return", 0.0) or 0.0),
         "expected_prob": float(entry.get("expected_prob", 0.0) or 0.0),
         "expected_pnl": float(entry.get("expected_pnl", 0.0) or 0.0),
         "entry_time": str(entry.get("entry_time", datetime.now(timezone.utc).isoformat())),
         "source": entry.get("source") or default_source,
+        "trail_high": float(entry.get("trail_high", price) or price),
     }
     return normalized
 
@@ -846,25 +846,16 @@ def build_exchange_holding(sym, amt, price=None):
     value = amount * last_price
     if value < MIN_HOLD_VALUE:
         return None
-    df = fetch_symbol_ohlcv(sym, slow_ema + 60)
-    if df.empty:
-        return None
-    df["atr"] = calc_atr(df, atr_period)
-    atr_series = df["atr"].replace([np.inf, -np.inf], np.nan).ffill()
-    atr_value = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
-    if not np.isfinite(atr_value) or atr_value <= 0:
-        atr_value = last_price * 0.02
-    atr = max(atr_value, 1e-9)
     entry = {
         "amount": amount,
         "entry_price": last_price,
-        "stop_loss": last_price - ATR_SL_MULT * atr,
-        "take_profit": last_price + ATR_TP_MULT * atr,
+        "stop_loss": last_price * 0.98,
         "expected_return": 0.0,
         "expected_prob": 0.0,
         "expected_pnl": 0.0,
         "entry_time": datetime.now(timezone.utc).isoformat(),
-        "source": "exchange"
+        "source": "exchange",
+        "trail_high": last_price,
     }
     return entry
 
@@ -977,7 +968,8 @@ def print_dashboard(tickers, holdings, state, interval, next_sym, next_prob, cur
                 price = tickers[sym]["last"]
                 pnl = (price - h["entry_price"]) * h["amount"]
                 color = Fore.GREEN if pnl >= 0 else Fore.RED
-                print(color + f"  {sym:<10} Price: {price:.4f}  PnL: {pnl:+.2f}  SL: {h['stop_loss']:.4f}  TP: {h['take_profit']:.4f}")
+                trail_high = h.get("trail_high", h["entry_price"])
+                print(color + f"  {sym:<10} Price: {price:.4f}  PnL: {pnl:+.2f}  SL: {h['stop_loss']:.4f}  TH: {trail_high:.4f}")
     print(Fore.WHITE + "-"*65)
     if next_sym:
         print(Fore.BLUE + Style.BRIGHT + f"Next Target Symbol: {next_sym}  (Prob: {next_prob:.2f})")
@@ -1013,7 +1005,8 @@ def print_debug_status(tickers, holdings, state, interval, next_sym, next_prob, 
             price = tickers[sym]["last"]
             pnl = (price - h["entry_price"]) * h["amount"]
             color = Fore.GREEN if pnl >= 0 else Fore.RED
-            print(color + f"    {sym:<10} price {price:.4f} pnl {pnl:+.2f} sl {h['stop_loss']:.4f} tp {h['take_profit']:.4f}")
+            trail_high = h.get("trail_high", h["entry_price"])
+            print(color + f"    {sym:<10} price {price:.4f} pnl {pnl:+.2f} sl {h['stop_loss']:.4f} th {trail_high:.4f}")
     print(Fore.WHITE + "-"*65)
 
 
@@ -1060,7 +1053,7 @@ while True:
         portfolio_mod = portfolio_risk_adjustment(holdings, data_dict)
         state["last_portfolio_modifier"] = portfolio_mod
 
-        best_sym, best_score, best_prob, best_price, best_atr = None, -np.inf, 0, 0, 0
+        best_sym, best_score, best_prob, best_price = None, -np.inf, 0, 0
         best_threshold, best_risk_mod, best_expected = entry_threshold, 1.0, 0.0
         for sym, df in data:
             if df.empty:
@@ -1109,64 +1102,79 @@ while True:
             score = float(p) if AGGRESSIVE_MODE else float(p * max(net_expected, 1e-6))
             if score > best_score:
                 best_sym, best_score = sym, score
-                best_prob, best_price, best_atr = p, price, atr
+                best_prob, best_price = p, price
                 best_threshold = 0.52 if AGGRESSIVE_MODE else sym_threshold
                 best_risk_mod, best_expected = risk_mod, net_expected
 
         if best_sym and best_sym not in holdings and (AGGRESSIVE_MODE or best_prob > best_threshold):
-            corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
-            if AGGRESSIVE_MODE or corr < MAX_SYMBOL_CORRELATION:
-                used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
-                if len(holdings) < MAX_OPEN_POSITIONS and used_cap < effective_capital() * MAX_CAPITAL_EXPOSURE:
-                    vol_mod = 1.0 if AGGRESSIVE_MODE else volatility_risk_modifier(btc_ctx)
-                    alloc = current_risk * best_risk_mod * vol_mod * portfolio_mod * effective_capital()
-                    max_alloc = max(effective_capital() * MAX_CAPITAL_EXPOSURE - used_cap, 0)
-                    alloc = min(alloc, max_alloc)
-                    if alloc > 0:
-                        amt = alloc / best_price
-                        if LIVE_MODE:
-                            execute_buy(best_sym, amt)
-                        expected_pnl = alloc * best_expected
-                        holdings[best_sym] = {
-                            "amount": amt,
-                            "entry_price": best_price,
-                            "stop_loss": best_price - ATR_SL_MULT * best_atr,
-                            "take_profit": best_price + ATR_TP_MULT * best_atr,
-                            "expected_return": best_expected,
-                            "expected_prob": best_prob,
-                            "expected_pnl": expected_pnl,
-                            "entry_time": datetime.now(timezone.utc).isoformat(),
-                            "source": "bot"
-                        }
-                        log_trade("entry", best_sym, {
-                            "amount": amt,
-                            "price": best_price,
-                            "prob": best_prob,
-                            "expected_return": best_expected,
-                            "expected_pnl": expected_pnl,
-                            "allocation": alloc,
-                            "threshold": best_threshold,
-                            "risk_mod": best_risk_mod,
-                            "portfolio_mod": portfolio_mod
-                        })
-                        persist_holdings(holdings)
+            if len(holdings) >= MAX_OPEN_POSITIONS:
+                log_decision(best_sym, {"reason": "max_positions_reached", "open_positions": len(holdings)})
             else:
-                log_decision(best_sym, {"reason": "blocked_correlation", "correlation": corr})
-
+                corr = max_correlation_with_holdings(best_sym, data_dict.get(best_sym), holdings, data_dict)
+                if AGGRESSIVE_MODE or corr < MAX_SYMBOL_CORRELATION:
+                    used_cap = sum(h["entry_price"] * h["amount"] for h in holdings.values())
+                    if used_cap < effective_capital() * MAX_CAPITAL_EXPOSURE:
+                        per_trade_capital = effective_capital() / MAX_OPEN_POSITIONS
+                        max_alloc = max(effective_capital() * MAX_CAPITAL_EXPOSURE - used_cap, 0)
+                        alloc = min(per_trade_capital, max_alloc)
+                        if alloc > 0:
+                            amt = alloc / best_price
+                            if LIVE_MODE:
+                                execute_buy(best_sym, amt)
+                            expected_pnl = alloc * best_expected
+                            holdings[best_sym] = {
+                                "amount": amt,
+                                "entry_price": best_price,
+                                "stop_loss": best_price * 0.98,
+                                "expected_return": best_expected,
+                                "expected_prob": best_prob,
+                                "expected_pnl": expected_pnl,
+                                "entry_time": datetime.now(timezone.utc).isoformat(),
+                                "source": "bot",
+                                "trail_high": best_price,
+                            }
+                            log_trade("entry", best_sym, {
+                                "amount": amt,
+                                "price": best_price,
+                                "prob": best_prob,
+                                "expected_return": best_expected,
+                                "expected_pnl": expected_pnl,
+                                "allocation": alloc,
+                                "threshold": best_threshold,
+                                "risk_mod": best_risk_mod,
+                                "portfolio_mod": portfolio_mod
+                            })
+                            persist_holdings(holdings)
+                else:
+                    log_decision(best_sym, {"reason": "blocked_correlation", "correlation": corr})
         # Exit Management
         for sym, h in list(holdings.items()):
             if sym not in tickers:
                 continue
             price = tickers[sym]["last"]
-            pnl = (price - h["entry_price"]) * h["amount"]
-            pnl_ratio = (price - h["entry_price"]) / h["entry_price"]
+            entry_price = h["entry_price"]
+            pnl = (price - entry_price) * h["amount"]
+            gain_ratio = (price - entry_price) / entry_price
 
-            if pnl > 0:
-                new_stop = h["entry_price"] * (1 + pnl_ratio * lock_factor)
-                h["stop_loss"] = max(h["stop_loss"], new_stop)
+            trail_high = max(h.get("trail_high", entry_price), price)
+            h["trail_high"] = trail_high
 
-            if price <= h["stop_loss"] or price >= h["take_profit"]:
-                pnl = (price - h["entry_price"]) * h["amount"]
+            target_stop = entry_price * 0.98
+            if gain_ratio >= 0.05:
+                target_stop = trail_high * 0.98
+            elif gain_ratio >= 0.04:
+                target_stop = entry_price * 1.03
+            elif gain_ratio >= 0.03:
+                target_stop = entry_price * 1.02
+            elif gain_ratio >= 0.02:
+                target_stop = entry_price * 1.01
+            elif gain_ratio >= 0.01:
+                target_stop = entry_price
+
+            h["stop_loss"] = max(h["stop_loss"], target_stop)
+
+            if price <= h["stop_loss"]:
+                pnl = (price - entry_price) * h["amount"]
                 state["realized_profit"] += pnl
                 today = datetime.now().strftime("%Y-%m-%d")
                 if today != state.get("last_date"):
@@ -1176,7 +1184,7 @@ while True:
                 record_trade_pnl(pnl)
                 expected_pnl = h.get("expected_pnl", 0.0)
                 record_expected_vs_realized(expected_pnl, pnl)
-                exit_reason = "stop_loss" if price <= h["stop_loss"] else "take_profit"
+                exit_reason = "stop_loss"
                 hold_duration = None
                 if h.get("entry_time"):
                     try:
